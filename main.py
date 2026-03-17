@@ -383,7 +383,3 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
     from fastapi.responses import HTMLResponse
     return HTMLResponse(html)
 
-
-# ── Vercel serverless handler ─────────────────────────────────────────────────
-from mangum import Mangum
-handler = Mangum(app)
