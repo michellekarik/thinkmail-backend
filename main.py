@@ -1,13 +1,12 @@
 """
 MailMind Backend
 - Google OAuth login
-- Groq API proxy (your key, user never sees it)
-- Rate limiting (20 fixes/day free tier)
-- Zero email logging — email content is never stored
+- Groq API proxy
+- Supabase database for user tracking
+- Zero email logging
 """
 
 import os
-import time
 import hashlib
 import httpx
 from datetime import datetime, timedelta
@@ -22,6 +21,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from jose import jwt, JWTError
+from database import upsert_user, increment_usage, get_user_stats
 
 load_dotenv()
 
@@ -33,8 +33,6 @@ JWT_SECRET           = os.getenv("JWT_SECRET", "change-this-in-production")
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:8000")
 REDIRECT_URI         = os.getenv("REDIRECT_URI", "http://localhost:8000/auth/callback")
 FREE_TIER_LIMIT      = int(os.getenv("FREE_TIER_LIMIT", "20"))
-
-usage_tracker: dict = {}
 
 # ── App ───────────────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
@@ -84,27 +82,6 @@ def get_current_user(request: Request) -> dict:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated. Please sign in.")
     return verify_jwt(auth.split(" ", 1)[1])
-
-# ── Usage tracking ────────────────────────────────────────────────────────────
-def check_and_increment_usage(user_id: str) -> tuple[int, int]:
-    now = time.time()
-    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    reset_at = (midnight + timedelta(days=1)).timestamp()
-
-    if user_id not in usage_tracker or usage_tracker[user_id]["reset_at"] <= now:
-        usage_tracker[user_id] = {"count": 0, "reset_at": reset_at}
-
-    current = usage_tracker[user_id]["count"]
-    if current >= FREE_TIER_LIMIT:
-        reset_time = datetime.fromtimestamp(reset_at).strftime("%H:%M")
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily limit of {FREE_TIER_LIMIT} fixes reached. Resets at midnight ({reset_time})."
-        )
-
-    usage_tracker[user_id]["count"] += 1
-    new_count = usage_tracker[user_id]["count"]
-    return new_count, FREE_TIER_LIMIT - new_count
 
 # ── Groq helper ───────────────────────────────────────────────────────────────
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
@@ -227,7 +204,6 @@ async def auth_callback(code: str, request: Request):
             raise HTTPException(status_code=400, detail="Failed to exchange OAuth code.")
 
         access_token = token_response.json().get("access_token")
-
         user_response = await client.get(
             "https://www.googleapis.com/oauth2/v2/userinfo",
             headers={"Authorization": f"Bearer {access_token}"}
@@ -238,11 +214,13 @@ async def auth_callback(code: str, request: Request):
         user_info = user_response.json()
 
     user_id = hashlib.sha256(user_info["email"].encode()).hexdigest()[:16]
-    jwt_token = create_jwt(user_id, user_info["email"], user_info.get("name", ""))
-
     name = user_info.get("name", "")
     email = user_info["email"]
 
+    # Save user to Supabase
+    await upsert_user(email=email, name=name, user_id=user_id)
+
+    jwt_token = create_jwt(user_id, email, name)
     return RedirectResponse(
         f"{FRONTEND_URL}/auth/extension-callback?token={jwt_token}&name={name}&email={email}"
     )
@@ -259,23 +237,11 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
     font-family: 'Google Sans', sans-serif;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 100vh;
-    background: #111214;
-    color: #e8eaed;
-    flex-direction: column;
-    gap: 14px;
-    text-align: center;
-    padding: 24px;
-  }}
-  .icon {{
-    width: 56px; height: 56px; border-radius: 16px;
-    background: linear-gradient(135deg, #EA4335, #4285F4);
     display: flex; align-items: center; justify-content: center;
-    font-size: 24px; margin-bottom: 4px;
+    height: 100vh; background: #111214; color: #e8eaed;
+    flex-direction: column; gap: 14px; text-align: center; padding: 24px;
   }}
+  .icon {{ width: 56px; height: 56px; border-radius: 16px; background: linear-gradient(135deg, #EA4335, #4285F4); display: flex; align-items: center; justify-content: center; font-size: 24px; margin-bottom: 4px; }}
   h2 {{ font-size: 20px; font-weight: 600; }}
   p {{ color: #9aa0a6; font-size: 14px; line-height: 1.6; }}
   .email {{ color: #4285F4; font-size: 13px; }}
@@ -287,18 +253,11 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
 <div class="email">{email}</div>
 <p>You can close this tab and go back to Gmail.<br>MailMind is ready to use.</p>
 <script>
-  // Pass token back to the Chrome extension background script
-  // The background script is listening for this URL pattern
-  console.log('MailMind auth callback loaded');
-  
-  // Store in localStorage as fallback
   try {{
     localStorage.setItem('mailmind_token', '{token}');
     localStorage.setItem('mailmind_name', '{name}');
     localStorage.setItem('mailmind_email', '{email}');
   }} catch(e) {{}}
-
-  // Auto close after 3 seconds
   setTimeout(() => window.close(), 3000);
 </script>
 </body>
@@ -316,21 +275,27 @@ async def fix_email(
 ):
     """PRIVACY: Email content is NEVER logged or stored."""
     user_id = user["sub"]
-    fixes_used, fixes_remaining = check_and_increment_usage(user_id)
+
+    try:
+        fixes_used, fixes_remaining = await increment_usage(user_id)
+    except Exception as e:
+        raise HTTPException(status_code=429, detail=str(e))
+
     today = datetime.now().strftime("%A, %B %d %Y")
     messages = build_prompt(body.thread or "", body.draft or "", today)
     result = await call_groq(messages)
+
     return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
 
 @app.get("/usage")
 async def get_usage(user: dict = Depends(get_current_user)):
-    user_id = user["sub"]
-    now = time.time()
-    if user_id not in usage_tracker or usage_tracker[user_id]["reset_at"] <= now:
-        return {"fixes_used": 0, "fixes_remaining": FREE_TIER_LIMIT, "limit": FREE_TIER_LIMIT}
-    count = usage_tracker[user_id]["count"]
-    return {"fixes_used": count, "fixes_remaining": max(0, FREE_TIER_LIMIT - count), "limit": FREE_TIER_LIMIT}
+    stats = await get_user_stats(user["sub"])
+    return stats
 
 @app.get("/me")
 async def get_me(user: dict = Depends(get_current_user)):
-    return {"email": user.get("email"), "name": user.get("name"), "user_id": user.get("sub")}
+    return {
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "user_id": user.get("sub")
+    }
