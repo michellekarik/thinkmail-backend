@@ -1,0 +1,10 @@
+{
+  "name": "mailmind-backend",
+  "version": "1.0.0",
+  "description": "MailMind Backend - FastAPI with Vercel Web Analytics",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@vercel/analytics": "^1.4.1"
+  }
+}

@@ -346,7 +346,10 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
     """
     html = f"""<!DOCTYPE html>
 <html>
-<head><title>MailMind — Signing in...</title>
+<head>
+<title>MailMind — Signing in...</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body {{ font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #0e0e10; color: #f0effe; flex-direction: column; gap: 16px; }}
   .icon {{ font-size: 48px; }}
@@ -377,6 +380,12 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
   }}, '*');
 
   setTimeout(() => window.close(), 2000);
+</script>
+
+<!-- Vercel Web Analytics -->
+<script type="module">
+  import { inject } from 'https://cdn.jsdelivr.net/npm/@vercel/analytics@latest/dist/index.mjs';
+  inject();
 </script>
 </body>
 </html>"""
