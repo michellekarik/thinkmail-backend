@@ -50,6 +50,7 @@ app.add_middleware(
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"error": "Too many requests."})
 
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class FixRequest(BaseModel):
@@ -66,9 +67,9 @@ class CoachRequest(BaseModel):
     draft: Optional[str] = ""
 
 class CoachResponse(BaseModel):
-    ok: bool        # True = issue found, False = draft looks fine
-    problem: str    # What's wrong with the draft tone
-    fix: str        # The better version to say instead
+    improved: str   # The polished version of the draft, matching thread format/style
+    note: str       # One line: what was adjusted and why. Empty if nothing changed.
+
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -93,13 +94,13 @@ def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Not authenticated. Please sign in.")
     return verify_jwt(auth.split(" ", 1)[1])
 
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
     no_draft_msg = "USER HAS NO DRAFT — Write the reply entirely from scratch based on the full thread context."
     has_draft_msg = "USER DRAFT REPLY:\n---\n" + draft + "\n---"
     draft_section = has_draft_msg if draft.strip() else no_draft_msg
-
     thread_section = thread.strip() if thread.strip() else "No thread found — only a draft is available."
 
     if not thread.strip() and not draft.strip():
@@ -153,39 +154,66 @@ SUGGESTED REPLY:
 
 def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
     """
-    Lightweight prompt for live draft coaching.
-    Returns structured JSON: { ok, problem, fix }
-    ok=false means the draft is fine, ok=true means there's a tone issue.
+    Takes the user's draft and returns ONE polished version of it.
+
+    Critical behaviours:
+    - Study the thread's FORMAT: does it end with 'Thanks', 'Regards', a phone number,
+      sign-off, or nothing? Does it use bullet points? Short sentences or long paragraphs?
+      Casual 'hey' openers or formal 'Dear'? Mirror all of that exactly.
+    - Study the thread's TONE: is it a close colleague, a client, a boss, a stranger?
+      Casual banter? Formal business? Tense escalation? Match it.
+    - Keep the user's intent word-for-word where possible. Only change HOW it sounds.
+    - Never add things that weren't in the draft (don't invent apologies, offers, or promises).
+    - If the draft is already perfect for the situation — return it unchanged.
     """
     thread_section = thread.strip() if thread.strip() else "No prior thread — this is the opening message."
 
     system_content = (
-        "You are ThinkMail's live tone coach.\n"
+        "You are ThinkMail's silent writing polish engine.\n"
         "Today: " + today + "\n\n"
-        "Your job: read the email thread and the user's current draft reply, then decide in one pass:\n"
-        "1. Is the tone, vibe, or approach of this draft WRONG for this specific situation?\n"
-        "2. If yes — explain what's wrong in one plain sentence, then write a better version.\n"
-        "3. If the draft is appropriate — say it's fine.\n\n"
-        "You are on the USER's side. Never be mealy-mouthed. If a draft sounds weak, vague, "
-        "pushover, passive-aggressive, or tone-deaf given the thread — flag it clearly.\n\n"
-        "Respond ONLY with a valid JSON object. No preamble, no markdown, no explanation outside the JSON.\n"
-        "Schema:\n"
-        '{"ok": true, "problem": "one sentence explaining what is wrong", "fix": "the better reply to send"}\n'
-        "OR if the draft is already good:\n"
-        '{"ok": false, "problem": "", "fix": ""}'
+
+        "YOUR JOB:\n"
+        "Read the full email thread and the user's current draft. "
+        "Return the best version of that draft — same message, better delivery.\n\n"
+
+        "STEP 1 — READ THE THREAD FORMAT:\n"
+        "Before touching the draft, study every email in the thread and extract:\n"
+        "- Sign-off style: 'Thanks', 'Regards', 'Cheers', name only, phone number, nothing?\n"
+        "- Opener style: 'Hey [name]', 'Hi', 'Dear', no opener at all?\n"
+        "- Length: short 2-3 line replies, or long paragraphs?\n"
+        "- Formality: casual friend, professional colleague, senior exec, client?\n"
+        "- Any recurring elements: bullet points, numbered lists, specific phrases they always use?\n\n"
+
+        "STEP 2 — POLISH THE DRAFT:\n"
+        "Rewrite the user's draft to:\n"
+        "- Match exactly the format and sign-off style you found in STEP 1.\n"
+        "- Correct the tone if it's too weak, too aggressive, or off for the relationship.\n"
+        "- Sound like a confident, real human. No filler, no corporate speak.\n"
+        "- Keep every point the user made. Do not add new content or promises.\n\n"
+
+        "STEP 3 — WRITE THE NOTE:\n"
+        "One short sentence (max 12 words) saying what you changed and why.\n"
+        "Examples: 'Matched casual tone and added sign-off from thread history'\n"
+        "          'Removed apologetic opener — thread context doesn't warrant it'\n"
+        "          'Kept formal format consistent with previous emails in thread'\n"
+        "If nothing needed changing, leave note as empty string.\n\n"
+
+        "OUTPUT: valid JSON only. No markdown, no explanation outside the JSON.\n"
+        '{"improved": "the polished reply", "note": "one line or empty"}'
     )
 
     user_content = (
         "Today: " + today + "\n\n"
-        "THREAD:\n" + thread_section + "\n\n"
-        "USER'S CURRENT DRAFT:\n---\n" + draft.strip() + "\n---\n\n"
-        "Is this draft appropriate for the situation? Reply with JSON only."
+        "FULL THREAD:\n" + thread_section + "\n\n"
+        "USER'S DRAFT:\n---\n" + draft.strip() + "\n---\n\n"
+        "Return the polished version. JSON only."
     )
 
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": user_content}
     ]
+
 
 # ── Groq caller ───────────────────────────────────────────────────────────────
 
@@ -216,6 +244,7 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024) -> str:
         raise HTTPException(status_code=502, detail=msg)
 
     return response.json()["choices"][0]["message"]["content"]
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -307,6 +336,7 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
     )
     return HTMLResponse(html)
 
+
 @app.post("/fix", response_model=FixResponse)
 @limiter.limit("30/minute")
 async def fix_email(
@@ -334,31 +364,29 @@ async def coach_email(
     user: dict = Depends(get_current_user)
 ):
     """
-    Live tone coaching — called on every draft keystroke (debounced on client).
-    Does NOT count against the user's daily fix limit.
-    Returns { ok, problem, fix } — ok=True means an issue was found.
+    Live draft polish — called once per draft session (client locks after first call).
+    Does NOT count against the user's daily fix quota.
+    Returns { improved, note } — improved is always the best version of their draft.
     """
-    if not body.draft or len(body.draft.strip()) < 20:
-        return CoachResponse(ok=False, problem="", fix="")
+    if not body.draft or len(body.draft.strip()) < 15:
+        return CoachResponse(improved=body.draft or "", note="")
 
     today = datetime.now().strftime("%A, %B %d %Y")
     messages = build_coach_prompt(body.thread or "", body.draft, today)
+    raw = await call_groq(messages, max_tokens=400)
 
-    raw = await call_groq(messages, max_tokens=300)
-
-    # Parse JSON response from the model
     try:
-        # Strip any accidental markdown fences
-        cleaned = raw.strip().strip("```json").strip("```").strip()
+        cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         data = json.loads(cleaned)
-        return CoachResponse(
-            ok=bool(data.get("ok", False)),
-            problem=str(data.get("problem", "")),
-            fix=str(data.get("fix", ""))
-        )
+        improved = str(data.get("improved", body.draft)).strip()
+        note = str(data.get("note", "")).strip()
+        # If model returned the exact same text, note should be empty
+        if improved == body.draft.strip():
+            note = ""
+        return CoachResponse(improved=improved, note=note)
     except (json.JSONDecodeError, KeyError):
-        # If parsing fails, silently return no-issue so we don't show a broken card
-        return CoachResponse(ok=False, problem="", fix="")
+        # Parsing failed — return original draft silently, don't show broken card
+        return CoachResponse(improved=body.draft, note="")
 
 
 @app.get("/usage")
