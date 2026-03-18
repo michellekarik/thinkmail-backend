@@ -135,9 +135,10 @@ def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
     has_draft = draft.strip()
     draft_section = (
         "USER HAS ALREADY TYPED THIS DRAFT:\n---\n" + draft + "\n---\n\n"
-        "Understand what they are trying to say and give them the best version for this situation."
+        "The user has started writing. Understand what they are trying to say and give them "
+        "the best version of it for this specific situation and relationship."
         if has_draft else
-        "USER HAS NO DRAFT — write the reply from scratch based on the full thread."
+        "USER HAS NO DRAFT — write the reply entirely from scratch based on the full thread context."
     )
     thread_section = thread.strip() if thread.strip() else "No thread — only a draft is available."
 
@@ -148,9 +149,18 @@ def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
             "Today: " + today + "\n\n"
             + thread_section + "\n\n"
             + draft_section + "\n\n"
-            + """Read every email in the thread carefully. Understand the full history, relationship, power dynamic.
+            + """Read every email in the thread carefully before responding.
 
-Respond in EXACTLY this format:
+STEP 1 — EXTRACT THE EMAIL FORMAT:
+Study every email in the thread and note exactly:
+- Opener style: Hey [name], Hi, Dear, straight to point, or nothing?
+- Sign-off: Thanks [name], Regards, Cheers, name only, phone number, or nothing?
+- Length: short punchy lines or full paragraphs?
+- Formality: close friend, colleague, boss, client, stranger?
+- Any recurring patterns: bullet points, line breaks, specific phrases?
+The SUGGESTED REPLY must mirror this format exactly. Non-negotiable.
+
+STEP 2 — RESPOND IN THIS EXACT FORMAT:
 
 TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
 URGENCY: [one word: Low / Medium / High]
@@ -159,25 +169,34 @@ INTENT: [one short phrase — what does the other person actually want?]
 RISK: [one word: Low / Medium / High]
 
 SITUATION:
-[3-4 sentences. What is happening? Who are these people, what is the history, what is the current moment?]
+[3-4 plain English sentences. What is happening? Who are these people, what is the history, what is the current moment?]
 
 CONTEXT ANALYSIS:
-[Power dynamic, promises made, tone shifts, what the user needs to know before replying.]
+[Power dynamic, tone shifts, promises made or broken, what the user must know before replying. Reference specific things said in the thread.]
 
 CONFLICTS:
-[Did the draft miss or contradict something from the thread? Is the user's tone wrong for the relationship? If nothing: No conflicts detected.]
+[Did the user's draft miss or contradict something from the thread? Is their tone wrong for this relationship? If nothing is wrong: No conflicts detected.]
 
 SUGGESTED REPLY:
-[The reply the user should send. If they wrote a draft — this is the corrected situationally-aware version. If no draft — write from scratch. Match the relationship format: opener, sign-off, length, formality from thread history. Sound like a real human.]"""
+[Write the reply the user should actually send.
+If they typed a draft: keep their intent, fix the delivery for this situation.
+If no draft: write from scratch.
+FORMAT RULE — non-negotiable: match the exact opener, sign-off, length and formality from the thread history. If emails in this thread end with "Thanks, Michelle" use that. If casual with no sign-off, do that. If they always write short 2-line replies, do that. Never invent a format that doesn't exist in the history.
+Sound like a confident real human. Never a pushover. No filler openers.]"""
         )
 
     system_content = (
         "You are ThinkMail — email situational intelligence.\n"
         "Today: " + today + "\n\n"
-        "You read the FULL thread and understand the relationship history.\n"
-        "You are on the USER's side. Always.\n"
-        "If the user wrote a draft, understand what they meant and help them say it right.\n"
-        "SUGGESTED REPLY must match the format and style of this specific email relationship.\n"
+        "Rules you never break:\n"
+        "1. Read the FULL thread — every email, not just the last one.\n"
+        "2. You are on the USER's side. Always.\n"
+        "3. If the user typed a draft, understand what they meant and say it right for this situation.\n"
+        "4. The SUGGESTED REPLY must always match the format of this specific email relationship — "
+        "same opener, same sign-off, same length, same formality as the thread history. "
+        "If the thread uses 'Thanks, [name]' use that. If it is casual with no sign-off, do that. "
+        "Never invent a format that does not match the history.\n"
+        "5. Sound like a real human who knows this person. No generic AI text.\n"
         "Always follow the exact output format."
     )
 
@@ -186,9 +205,6 @@ SUGGESTED REPLY:
         {"role": "user", "content": user_content}
     ]
 
-
-# ── /coach prompt ─────────────────────────────────────────────────────────────
-# Compact prompt for llama-3.1-8b-instant — fast, focused, no fluff
 
 def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
     thread_section = thread.strip() if thread.strip() else "No prior thread."
