@@ -31,7 +31,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 JWT_SECRET           = os.getenv("JWT_SECRET", "change-this-in-production")
 FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:8000")
 REDIRECT_URI         = os.getenv("REDIRECT_URI", "http://localhost:8000/auth/callback")
-FREE_TIER_LIMIT      = int(os.getenv("FREE_TIER_LIMIT", "20"))
+FREE_TIER_LIMIT      = int(os.getenv("FREE_TIER_LIMIT", "50"))
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="ThinkMail API", version="1.0.0")
