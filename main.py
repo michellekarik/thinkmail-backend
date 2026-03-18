@@ -67,8 +67,9 @@ class CoachRequest(BaseModel):
     draft: Optional[str] = ""
 
 class CoachResponse(BaseModel):
-    improved: str   # The polished version of the draft, matching thread format/style
-    note: str       # One line: what was adjusted and why. Empty if nothing changed.
+    improved: str   # Rewritten reply matching thread format and situation
+    note: str       # One line: what was changed and why
+    what_was_wrong: str  # Specific diagnosis of the draft's problem
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -95,13 +96,19 @@ def get_current_user(request: Request) -> dict:
     return verify_jwt(auth.split(" ", 1)[1])
 
 
-# ── Prompts ───────────────────────────────────────────────────────────────────
+# ── /fix prompt ───────────────────────────────────────────────────────────────
 
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
-    no_draft_msg = "USER HAS NO DRAFT — Write the reply entirely from scratch based on the full thread context."
-    has_draft_msg = "USER DRAFT REPLY:\n---\n" + draft + "\n---"
-    draft_section = has_draft_msg if draft.strip() else no_draft_msg
-    thread_section = thread.strip() if thread.strip() else "No thread found — only a draft is available."
+    has_draft = draft.strip()
+    draft_section = (
+        "USER HAS ALREADY TYPED THIS DRAFT REPLY:\n---\n" + draft + "\n---\n\n"
+        "The user has started writing. Your job is to understand what they're trying to say "
+        "and give them the best version of it for this specific situation and relationship."
+        if has_draft else
+        "USER HAS NO DRAFT — write the reply entirely from scratch based on the full thread context."
+    )
+
+    thread_section = thread.strip() if thread.strip() else "No thread — only a draft is available."
 
     if not thread.strip() and not draft.strip():
         user_content = "Tell the user to open a Gmail thread first."
@@ -110,40 +117,39 @@ def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
             "Today: " + today + "\n\n"
             + thread_section + "\n\n"
             + draft_section + "\n\n"
-            + """Read every single email in the thread above carefully before responding.
-Understand who said what, when, what was promised, what changed, and what the current situation actually is.
+            + """Read every email in the thread carefully. Understand the full history,
+relationship, power dynamic, and what has been said before.
 
-Respond in EXACTLY this format — nothing outside these sections:
+Respond in EXACTLY this format:
 
 TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
 URGENCY: [one word: Low / Medium / High]
 VIBE: [one word: Positive / Neutral / Tense / Hostile / Warm]
 INTENT: [one short phrase — what does the other person actually want?]
-RISK: [one word: Low / Medium / High — how risky is it to reply wrong here?]
+RISK: [one word: Low / Medium / High]
 
 SITUATION:
-[3-4 plain English sentences. Summarize the ENTIRE thread history. Who are the people involved? What has been said across all emails? What is the actual current situation? Write like explaining it to a friend who hasn't read any of it.]
+[3-4 sentences. What is actually happening in this thread? Who are these people, what's the history, what's the current moment?]
 
 CONTEXT ANALYSIS:
-[What is the deeper context? Is there a power dynamic? Has anything been promised and not delivered? Is the tone changing across the thread? What should the user be aware of before replying? Be specific and reference actual things said.]
+[What's the deeper context — power dynamic, promises made, tone shifts, what the user needs to know before replying?]
 
 CONFLICTS:
-[Look across the ENTIRE thread. Did someone make a promise they are now contradicting? Is the draft ignoring something important said earlier? Is someone moving goalposts? Be specific. If nothing is wrong say exactly: No conflicts detected.]
+[Did the draft miss or contradict something from the thread? Is the user's tone wrong for the relationship? Be specific. If nothing: No conflicts detected.]
 
 SUGGESTED REPLY:
-[Write the reply the user should actually send. Sound like a real human. Match the tone of the conversation. Never use filler openers. If the other person is wrong, address it directly but not rudely. If no draft was provided, write the complete reply from scratch. Be concise. Never be a pushover.]"""
+[The reply the user should send. If they wrote a draft — this is the corrected, situationally-aware version of what they were trying to say, in the format that matches this specific email relationship. If no draft — write from scratch. Sound like a real human. Match the relationship. Never be a pushover.]"""
         )
 
     system_content = (
         "You are ThinkMail — an email situational intelligence assistant.\n"
         "Today: " + today + "\n\n"
-        "Your core job: Read the FULL email thread. Understand the complete history and context — not just the latest message.\n"
-        "You are on the USER side. Always.\n"
-        "You think like a smart friend who read every email in the chain.\n"
-        "You catch timeline conflicts, broken promises, power dynamics, and meaning errors.\n"
-        "You write replies that sound human — confident, direct, appropriate.\n"
-        "You never generate generic AI text. You never suggest pushover replies.\n"
-        "Always follow the exact output format — every section, every time."
+        "You read the FULL thread. You understand the complete relationship history — not just the latest message.\n"
+        "You are on the USER's side. Always.\n"
+        "If the user wrote a draft, you understand what they meant to say and help them say it RIGHT for this situation.\n"
+        "You catch tone mismatches, power dynamics, broken promises, and relationship context errors.\n"
+        "You write replies that sound like a confident real human who knows this person.\n"
+        "Always follow the exact output format."
     )
 
     return [
@@ -152,48 +158,72 @@ SUGGESTED REPLY:
     ]
 
 
+# ── /coach prompt ─────────────────────────────────────────────────────────────
+# This is the core of what makes ThinkMail different.
+# The user typed something in their draft. We:
+# 1. Diagnose exactly what's wrong with it given the situation + relationship
+# 2. Rewrite it to match the tone, format, and style of their email history
+# 3. Explain the fix in one line so they understand why
+
 def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
     thread_section = thread.strip() if thread.strip() else "No prior thread — this is the opening message."
 
     system_content = (
-        "You are ThinkMail's writing polish engine.\n"
+        "You are ThinkMail's situational writing coach.\n"
         "Today: " + today + "\n\n"
 
-        "YOUR ONLY JOB: take the user's draft and return the BEST version of it for this specific situation.\n\n"
+        "The user has typed something in their Gmail reply box. "
+        "Your job is to do three things:\n\n"
 
-        "STEP 1 — STUDY THE THREAD HISTORY CAREFULLY:\n"
-        "Read every email in the thread and note EXACTLY:\n"
-        "- How does the other person open their emails? ('Hey', 'Hi [name]', 'Dear', straight to the point?)\n"
-        "- How do they sign off? ('Thanks', 'Regards', 'Cheers', their name, phone number, nothing?)\n"
-        "- How long are their replies? (1 line, 3 lines, full paragraphs?)\n"
-        "- What is the relationship? (close colleague, boss, client, stranger, friend?)\n"
-        "- What is the vibe? (casual banter, professional, tense, urgent, friendly?)\n"
-        "- Any specific formatting? (bullet points, numbered steps, line breaks between topics?)\n\n"
+        "━━ STEP 1: DIAGNOSE THE DRAFT ━━\n"
+        "Read the FULL thread history and the user's draft. Ask yourself:\n"
+        "- Is the tone right for this specific relationship and situation?\n"
+        "- Is the user being too aggressive, too weak, too formal, too casual?\n"
+        "- Are they missing something important from the thread history?\n"
+        "- Are they contradicting something said earlier in the thread?\n"
+        "- Is the vibe off — e.g. friendly chat but the draft sounds corporate?\n"
+        "- Example: if they wrote 'fuck you' to a boss in a tense escalation — "
+        "that's the wrong tone. If they wrote 'sorry for the trouble' when the "
+        "other person is actually at fault — that's too weak. Be direct.\n\n"
 
-        "STEP 2 — REWRITE THE USER'S DRAFT:\n"
-        "- Mirror the EXACT format and sign-off style from STEP 1. If the thread ends with 'Thanks, [Name]' — do that. If it's casual with no sign-off — do that. If there's a phone number — include it.\n"
-        "- Fix the tone to match the relationship and situation. If the draft is too aggressive, soften it. If it's too weak or apologetic for the situation, strengthen it.\n"
-        "- Keep the user's core message and intent. Do not add promises, apologies, or content that wasn't in the draft.\n"
-        "- Sound like a real confident human. No corporate filler, no 'I hope this email finds you well'.\n\n"
+        "━━ STEP 2: STUDY THE EMAIL RELATIONSHIP FORMAT ━━\n"
+        "Look at EVERY email in the thread history and extract:\n"
+        "- How do they open? ('Hey [name]', 'Hi', 'Dear', straight to point, nothing?)\n"
+        "- How do they sign off? ('Thanks', 'Regards', 'Cheers', name only, "
+        "phone number, nothing at all?)\n"
+        "- What length? (1 line punchy, 3 lines, full paragraphs?)\n"
+        "- Formality level? (close friend, work colleague, boss, client, stranger?)\n"
+        "- Any patterns? (bullet points, numbered lists, line breaks, specific phrases?)\n"
+        "This is NOT optional. The rewritten reply MUST match this format exactly.\n\n"
 
-        "STEP 3 — ONE LINE NOTE:\n"
-        "Write ONE sentence (max 12 words) explaining what you changed. Examples:\n"
-        "  'Matched casual tone and sign-off style from thread'\n"
-        "  'Softened aggressive opener — relationship is professional'\n"
-        "  'Added Regards sign-off consistent with thread history'\n"
-        "If the draft was already perfect, return it unchanged and leave note empty.\n\n"
+        "━━ STEP 3: REWRITE THE DRAFT ━━\n"
+        "Take what the user was TRYING to say and rewrite it so that:\n"
+        "- It says the same thing but in the right tone for this situation\n"
+        "- It matches the exact format and style of this email relationship\n"
+        "- It sounds like a confident real human who knows this person well\n"
+        "- It includes the correct sign-off, opener, and length from STEP 2\n"
+        "- It does not add new promises or content that wasn't in the draft\n\n"
 
-        "CRITICAL: Output ONLY valid JSON. No markdown fences, no explanation, nothing else.\n"
-        '{"improved": "full rewritten reply here", "note": "one line or empty string"}' 
+        "━━ OUTPUT FORMAT ━━\n"
+        "Return ONLY a valid JSON object. No markdown, no explanation outside JSON.\n"
+        "{\n"
+        '  "what_was_wrong": "specific one-sentence diagnosis of the draft issue",\n'
+        '  "improved": "the full rewritten reply, formatted to match thread history",\n'
+        '  "note": "one line: what changed and why — e.g. \'Matched casual tone, added Cheers sign-off from thread\'"\n'
+        "}\n\n"
+        "If the draft is already perfect — return it unchanged with what_was_wrong and note as empty strings."
     )
 
     user_content = (
         "Today: " + today + "\n\n"
-        "=== FULL EMAIL THREAD (study this carefully) ===\n"
+        "━━ FULL EMAIL THREAD HISTORY (read every message) ━━\n"
         + thread_section +
-        "\n\n=== USER'S CURRENT DRAFT ===\n"
+        "\n\n━━ WHAT THE USER TYPED IN THEIR DRAFT ━━\n"
         + draft.strip() +
-        "\n\nReturn ONLY the JSON object with the improved reply."
+        "\n\n"
+        "Diagnose what's wrong with the draft given this specific situation and relationship. "
+        "Rewrite it to say the same thing in the right way, formatted like their email history. "
+        "Return JSON only."
     )
 
     return [
@@ -287,14 +317,14 @@ async def auth_callback(code: str, request: Request):
         user_info = user_response.json()
 
     user_id = hashlib.sha256(user_info["email"].encode()).hexdigest()[:16]
-    name = user_info.get("name", "")
-    email = user_info["email"]
+    name    = user_info.get("name", "")
+    email   = user_info["email"]
 
     await upsert_user(email=email, name=name, user_id=user_id)
-
     jwt_token = create_jwt(user_id, email, name)
     return RedirectResponse(
-        FRONTEND_URL + "/auth/extension-callback?token=" + jwt_token + "&name=" + name + "&email=" + email
+        FRONTEND_URL + "/auth/extension-callback?token=" + jwt_token +
+        "&name=" + name + "&email=" + email
     )
 
 @app.get("/auth/extension-callback")
@@ -303,15 +333,14 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
         "<!DOCTYPE html><html><head><title>ThinkMail</title>"
         "<style>*{box-sizing:border-box;margin:0;padding:0}"
         "body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;"
-        "height:100vh;background:#0d0f10;color:#edf0f2;flex-direction:column;gap:14px;text-align:center;padding:24px}"
+        "height:100vh;background:#0d0f10;color:#edf0f2;flex-direction:column;gap:14px;"
+        "text-align:center;padding:24px}"
         ".icon{width:52px;height:52px;border-radius:14px;"
         "background:linear-gradient(135deg,#4285F4,#34A853);display:flex;"
         "align-items:center;justify-content:center;font-size:22px;margin-bottom:4px}"
-        "h2{font-size:20px;font-weight:600}"
-        "p{color:#8d9499;font-size:13px;line-height:1.6}"
+        "h2{font-size:20px;font-weight:600}p{color:#8d9499;font-size:13px;line-height:1.6}"
         ".em{color:#4285F4;font-size:13px}</style></head><body>"
-        "<div class='icon'>✦</div>"
-        "<h2>Signed in!</h2>"
+        "<div class='icon'>✦</div><h2>Signed in!</h2>"
         "<div class='em'>" + email + "</div>"
         "<p>You can close this tab and go back to Gmail.</p>"
         "<script>"
@@ -337,9 +366,9 @@ async def fix_email(
     except Exception as e:
         raise HTTPException(status_code=429, detail=str(e))
 
-    today = datetime.now().strftime("%A, %B %d %Y")
+    today    = datetime.now().strftime("%A, %B %d %Y")
     messages = build_prompt(body.thread or "", body.draft or "", today)
-    result = await call_groq(messages, max_tokens=1024)
+    result   = await call_groq(messages, max_tokens=1024)
     return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
 
 
@@ -351,29 +380,36 @@ async def coach_email(
     user: dict = Depends(get_current_user)
 ):
     """
-    Live draft polish — called once per draft session (client locks after first call).
-    Does NOT count against the user's daily fix quota.
-    Returns { improved, note } — improved is always the best version of their draft.
+    Called once when user pauses typing in their draft.
+    Diagnoses what's wrong with the draft given the full thread context,
+    then rewrites it matching the email relationship's format and history.
+    Does NOT count against the daily fix quota.
     """
-    if not body.draft or len(body.draft.strip()) < 15:
-        return CoachResponse(improved=body.draft or "", note="")
+    if not body.draft or len(body.draft.strip()) < 3:
+        return CoachResponse(improved="", note="", what_was_wrong="")
 
-    today = datetime.now().strftime("%A, %B %d %Y")
+    today    = datetime.now().strftime("%A, %B %d %Y")
     messages = build_coach_prompt(body.thread or "", body.draft, today)
-    raw = await call_groq(messages, max_tokens=400)
+    raw      = await call_groq(messages, max_tokens=500)
 
     try:
-        cleaned = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        cleaned = raw.strip()
+        # Strip markdown fences if model adds them
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```")[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
         data = json.loads(cleaned)
-        improved = str(data.get("improved", body.draft)).strip()
-        note = str(data.get("note", "")).strip()
-        # If model returned the exact same text, note should be empty
-        if improved == body.draft.strip():
-            note = ""
-        return CoachResponse(improved=improved, note=note)
+        return CoachResponse(
+            what_was_wrong = str(data.get("what_was_wrong", "")).strip(),
+            improved       = str(data.get("improved", body.draft)).strip(),
+            note           = str(data.get("note", "")).strip()
+        )
     except (json.JSONDecodeError, KeyError):
-        # Parsing failed — return original draft silently, don't show broken card
-        return CoachResponse(improved=body.draft, note="")
+        # Never show a broken card — silently return original
+        return CoachResponse(improved=body.draft, note="", what_was_wrong="")
 
 
 @app.get("/usage")
