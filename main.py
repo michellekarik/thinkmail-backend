@@ -1,7 +1,7 @@
 """
 ThinkMail Backend
 - Google OAuth login
-- Groq API proxy
+- Groq API proxy (70b for analysis, 8b-instant for coach)
 - Supabase database for user tracking
 - Zero email logging
 """
@@ -67,9 +67,9 @@ class CoachRequest(BaseModel):
     draft: Optional[str] = ""
 
 class CoachResponse(BaseModel):
-    improved: str   # Rewritten reply matching thread format and situation
-    note: str       # One line: what was changed and why
-    what_was_wrong: str  # Specific diagnosis of the draft's problem
+    improved: str
+    note: str
+    what_was_wrong: str
 
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -96,149 +96,15 @@ def get_current_user(request: Request) -> dict:
     return verify_jwt(auth.split(" ", 1)[1])
 
 
-# ── /fix prompt ───────────────────────────────────────────────────────────────
-
-def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
-    has_draft = draft.strip()
-    draft_section = (
-        "USER HAS ALREADY TYPED THIS DRAFT REPLY:\n---\n" + draft + "\n---\n\n"
-        "The user has started writing. Your job is to understand what they're trying to say "
-        "and give them the best version of it for this specific situation and relationship."
-        if has_draft else
-        "USER HAS NO DRAFT — write the reply entirely from scratch based on the full thread context."
-    )
-
-    thread_section = thread.strip() if thread.strip() else "No thread — only a draft is available."
-
-    if not thread.strip() and not draft.strip():
-        user_content = "Tell the user to open a Gmail thread first."
-    else:
-        user_content = (
-            "Today: " + today + "\n\n"
-            + thread_section + "\n\n"
-            + draft_section + "\n\n"
-            + """Read every email in the thread carefully. Understand the full history,
-relationship, power dynamic, and what has been said before.
-
-Respond in EXACTLY this format:
-
-TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
-URGENCY: [one word: Low / Medium / High]
-VIBE: [one word: Positive / Neutral / Tense / Hostile / Warm]
-INTENT: [one short phrase — what does the other person actually want?]
-RISK: [one word: Low / Medium / High]
-
-SITUATION:
-[3-4 sentences. What is actually happening in this thread? Who are these people, what's the history, what's the current moment?]
-
-CONTEXT ANALYSIS:
-[What's the deeper context — power dynamic, promises made, tone shifts, what the user needs to know before replying?]
-
-CONFLICTS:
-[Did the draft miss or contradict something from the thread? Is the user's tone wrong for the relationship? Be specific. If nothing: No conflicts detected.]
-
-SUGGESTED REPLY:
-[The reply the user should send. If they wrote a draft — this is the corrected, situationally-aware version of what they were trying to say, in the format that matches this specific email relationship. If no draft — write from scratch. Sound like a real human. Match the relationship. Never be a pushover.]"""
-        )
-
-    system_content = (
-        "You are ThinkMail — an email situational intelligence assistant.\n"
-        "Today: " + today + "\n\n"
-        "You read the FULL thread. You understand the complete relationship history — not just the latest message.\n"
-        "You are on the USER's side. Always.\n"
-        "If the user wrote a draft, you understand what they meant to say and help them say it RIGHT for this situation.\n"
-        "You catch tone mismatches, power dynamics, broken promises, and relationship context errors.\n"
-        "You write replies that sound like a confident real human who knows this person.\n"
-        "Always follow the exact output format."
-    )
-
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content}
-    ]
-
-
-# ── /coach prompt ─────────────────────────────────────────────────────────────
-# This is the core of what makes ThinkMail different.
-# The user typed something in their draft. We:
-# 1. Diagnose exactly what's wrong with it given the situation + relationship
-# 2. Rewrite it to match the tone, format, and style of their email history
-# 3. Explain the fix in one line so they understand why
-
-def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
-    thread_section = thread.strip() if thread.strip() else "No prior thread — this is the opening message."
-
-    system_content = (
-        "You are ThinkMail's situational writing coach.\n"
-        "Today: " + today + "\n\n"
-
-        "The user has typed something in their Gmail reply box. "
-        "Your job is to do three things:\n\n"
-
-        "━━ STEP 1: DIAGNOSE THE DRAFT ━━\n"
-        "Read the FULL thread history and the user's draft. Ask yourself:\n"
-        "- Is the tone right for this specific relationship and situation?\n"
-        "- Is the user being too aggressive, too weak, too formal, too casual?\n"
-        "- Are they missing something important from the thread history?\n"
-        "- Are they contradicting something said earlier in the thread?\n"
-        "- Is the vibe off — e.g. friendly chat but the draft sounds corporate?\n"
-        "- Example: if they wrote 'fuck you' to a boss in a tense escalation — "
-        "that's the wrong tone. If they wrote 'sorry for the trouble' when the "
-        "other person is actually at fault — that's too weak. Be direct.\n\n"
-
-        "━━ STEP 2: STUDY THE EMAIL RELATIONSHIP FORMAT ━━\n"
-        "Look at EVERY email in the thread history and extract:\n"
-        "- How do they open? ('Hey [name]', 'Hi', 'Dear', straight to point, nothing?)\n"
-        "- How do they sign off? ('Thanks', 'Regards', 'Cheers', name only, "
-        "phone number, nothing at all?)\n"
-        "- What length? (1 line punchy, 3 lines, full paragraphs?)\n"
-        "- Formality level? (close friend, work colleague, boss, client, stranger?)\n"
-        "- Any patterns? (bullet points, numbered lists, line breaks, specific phrases?)\n"
-        "This is NOT optional. The rewritten reply MUST match this format exactly.\n\n"
-
-        "━━ STEP 3: REWRITE THE DRAFT ━━\n"
-        "Take what the user was TRYING to say and rewrite it so that:\n"
-        "- It says the same thing but in the right tone for this situation\n"
-        "- It matches the exact format and style of this email relationship\n"
-        "- It sounds like a confident real human who knows this person well\n"
-        "- It includes the correct sign-off, opener, and length from STEP 2\n"
-        "- It does not add new promises or content that wasn't in the draft\n\n"
-
-        "━━ OUTPUT FORMAT ━━\n"
-        "Return ONLY a valid JSON object. No markdown, no explanation outside JSON.\n"
-        "{\n"
-        '  "what_was_wrong": "specific one-sentence diagnosis of the draft issue",\n'
-        '  "improved": "the full rewritten reply, formatted to match thread history",\n'
-        '  "note": "one line: what changed and why — e.g. \'Matched casual tone, added Cheers sign-off from thread\'"\n'
-        "}\n\n"
-        "If the draft is already perfect — return it unchanged with what_was_wrong and note as empty strings."
-    )
-
-    user_content = (
-        "Today: " + today + "\n\n"
-        "━━ FULL EMAIL THREAD HISTORY (read every message) ━━\n"
-        + thread_section +
-        "\n\n━━ WHAT THE USER TYPED IN THEIR DRAFT ━━\n"
-        + draft.strip() +
-        "\n\n"
-        "Diagnose what's wrong with the draft given this specific situation and relationship. "
-        "Rewrite it to say the same thing in the right way, formatted like their email history. "
-        "Return JSON only."
-    )
-
-    return [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content}
-    ]
-
-
 # ── Groq caller ───────────────────────────────────────────────────────────────
+# model param lets /fix use the big accurate model,
+# while /coach uses llama-3.1-8b-instant (5-10x faster, good enough for polish)
 
-async def call_groq(messages: list[dict], max_tokens: int = 1024) -> str:
+async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "llama-3.3-70b-versatile") -> str:
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="Groq API key not configured.")
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -246,7 +112,7 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024) -> str:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama-3.3-70b-versatile",
+                "model": model,
                 "max_tokens": max_tokens,
                 "temperature": 0.3,
                 "messages": messages
@@ -261,6 +127,97 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024) -> str:
         raise HTTPException(status_code=502, detail=msg)
 
     return response.json()["choices"][0]["message"]["content"]
+
+
+# ── /fix prompt ───────────────────────────────────────────────────────────────
+
+def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
+    has_draft = draft.strip()
+    draft_section = (
+        "USER HAS ALREADY TYPED THIS DRAFT:\n---\n" + draft + "\n---\n\n"
+        "Understand what they are trying to say and give them the best version for this situation."
+        if has_draft else
+        "USER HAS NO DRAFT — write the reply from scratch based on the full thread."
+    )
+    thread_section = thread.strip() if thread.strip() else "No thread — only a draft is available."
+
+    if not thread.strip() and not draft.strip():
+        user_content = "Tell the user to open a Gmail thread first."
+    else:
+        user_content = (
+            "Today: " + today + "\n\n"
+            + thread_section + "\n\n"
+            + draft_section + "\n\n"
+            + """Read every email in the thread carefully. Understand the full history, relationship, power dynamic.
+
+Respond in EXACTLY this format:
+
+TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
+URGENCY: [one word: Low / Medium / High]
+VIBE: [one word: Positive / Neutral / Tense / Hostile / Warm]
+INTENT: [one short phrase — what does the other person actually want?]
+RISK: [one word: Low / Medium / High]
+
+SITUATION:
+[3-4 sentences. What is happening? Who are these people, what is the history, what is the current moment?]
+
+CONTEXT ANALYSIS:
+[Power dynamic, promises made, tone shifts, what the user needs to know before replying.]
+
+CONFLICTS:
+[Did the draft miss or contradict something from the thread? Is the user's tone wrong for the relationship? If nothing: No conflicts detected.]
+
+SUGGESTED REPLY:
+[The reply the user should send. If they wrote a draft — this is the corrected situationally-aware version. If no draft — write from scratch. Match the relationship format: opener, sign-off, length, formality from thread history. Sound like a real human.]"""
+        )
+
+    system_content = (
+        "You are ThinkMail — email situational intelligence.\n"
+        "Today: " + today + "\n\n"
+        "You read the FULL thread and understand the relationship history.\n"
+        "You are on the USER's side. Always.\n"
+        "If the user wrote a draft, understand what they meant and help them say it right.\n"
+        "SUGGESTED REPLY must match the format and style of this specific email relationship.\n"
+        "Always follow the exact output format."
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content}
+    ]
+
+
+# ── /coach prompt ─────────────────────────────────────────────────────────────
+# Compact prompt for llama-3.1-8b-instant — fast, focused, no fluff
+
+def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
+    thread_section = thread.strip() if thread.strip() else "No prior thread."
+
+    system_content = (
+        "You are ThinkMail, email situational coach. Today: " + today + "\n"
+        "User typed a draft reply. Do three things:\n"
+        "1. DIAGNOSE: Is tone/vibe wrong for this relationship and situation? "
+        "Too aggressive, too weak, too formal, off-vibe? One sentence.\n"
+        "2. FORMAT: From the thread extract opener style, sign-off, length, formality. "
+        "The rewrite MUST match this exactly.\n"
+        "3. REWRITE: Same message, right tone, correct format from step 2. "
+        "Confident real human. No filler. No new content.\n\n"
+        "Return ONLY valid JSON, no markdown, no explanation:\n"
+        '{"what_was_wrong":"one sentence diagnosis or empty if fine",'
+        '"improved":"full rewritten reply",'
+        '"note":"what changed, e.g. matched casual tone added sign-off or empty"}'
+    )
+
+    user_content = (
+        "THREAD:\n" + thread_section +
+        "\n\nDRAFT:\n" + draft.strip() +
+        "\n\nReturn JSON only."
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user",   "content": user_content}
+    ]
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -368,7 +325,8 @@ async def fix_email(
 
     today    = datetime.now().strftime("%A, %B %d %Y")
     messages = build_prompt(body.thread or "", body.draft or "", today)
-    result   = await call_groq(messages, max_tokens=1024)
+    # Full analysis uses the big accurate model
+    result   = await call_groq(messages, max_tokens=1024, model="llama-3.3-70b-versatile")
     return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
 
 
@@ -380,27 +338,25 @@ async def coach_email(
     user: dict = Depends(get_current_user)
 ):
     """
-    Called once when user pauses typing in their draft.
-    Diagnoses what's wrong with the draft given the full thread context,
-    then rewrites it matching the email relationship's format and history.
-    Does NOT count against the daily fix quota.
+    Live draft coach — called once when user pauses typing.
+    Uses llama-3.1-8b-instant: 5-10x faster than 70b, sub-2s responses.
+    Does NOT count against daily fix quota.
     """
     if not body.draft or len(body.draft.strip()) < 3:
         return CoachResponse(improved="", note="", what_was_wrong="")
 
     today    = datetime.now().strftime("%A, %B %d %Y")
     messages = build_coach_prompt(body.thread or "", body.draft, today)
-    raw      = await call_groq(messages, max_tokens=500)
+    # Fast model for real-time coaching
+    raw      = await call_groq(messages, max_tokens=350, model="llama-3.1-8b-instant")
 
     try:
         cleaned = raw.strip()
-        # Strip markdown fences if model adds them
         if cleaned.startswith("```"):
             cleaned = cleaned.split("```")[1]
             if cleaned.startswith("json"):
                 cleaned = cleaned[4:]
         cleaned = cleaned.strip()
-
         data = json.loads(cleaned)
         return CoachResponse(
             what_was_wrong = str(data.get("what_was_wrong", "")).strip(),
@@ -408,7 +364,6 @@ async def coach_email(
             note           = str(data.get("note", "")).strip()
         )
     except (json.JSONDecodeError, KeyError):
-        # Never show a broken card — silently return original
         return CoachResponse(improved=body.draft, note="", what_was_wrong="")
 
 
