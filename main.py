@@ -7,6 +7,7 @@ ThinkMail Backend
 """
 
 import os
+import json
 import hashlib
 import httpx
 from datetime import datetime, timedelta
@@ -49,6 +50,8 @@ app.add_middleware(
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"error": "Too many requests."})
 
+# ── Models ────────────────────────────────────────────────────────────────────
+
 class FixRequest(BaseModel):
     thread: Optional[str] = ""
     draft: Optional[str] = ""
@@ -57,6 +60,17 @@ class FixResponse(BaseModel):
     result: str
     fixes_used: int
     fixes_remaining: int
+
+class CoachRequest(BaseModel):
+    thread: Optional[str] = ""
+    draft: Optional[str] = ""
+
+class CoachResponse(BaseModel):
+    ok: bool        # True = issue found, False = draft looks fine
+    problem: str    # What's wrong with the draft tone
+    fix: str        # The better version to say instead
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def create_jwt(user_id: str, email: str, name: str) -> str:
     payload = {
@@ -78,6 +92,8 @@ def get_current_user(request: Request) -> dict:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated. Please sign in.")
     return verify_jwt(auth.split(" ", 1)[1])
+
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
     no_draft_msg = "USER HAS NO DRAFT — Write the reply entirely from scratch based on the full thread context."
@@ -134,7 +150,46 @@ SUGGESTED REPLY:
         {"role": "user", "content": user_content}
     ]
 
-async def call_groq(messages: list[dict]) -> str:
+
+def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
+    """
+    Lightweight prompt for live draft coaching.
+    Returns structured JSON: { ok, problem, fix }
+    ok=false means the draft is fine, ok=true means there's a tone issue.
+    """
+    thread_section = thread.strip() if thread.strip() else "No prior thread — this is the opening message."
+
+    system_content = (
+        "You are ThinkMail's live tone coach.\n"
+        "Today: " + today + "\n\n"
+        "Your job: read the email thread and the user's current draft reply, then decide in one pass:\n"
+        "1. Is the tone, vibe, or approach of this draft WRONG for this specific situation?\n"
+        "2. If yes — explain what's wrong in one plain sentence, then write a better version.\n"
+        "3. If the draft is appropriate — say it's fine.\n\n"
+        "You are on the USER's side. Never be mealy-mouthed. If a draft sounds weak, vague, "
+        "pushover, passive-aggressive, or tone-deaf given the thread — flag it clearly.\n\n"
+        "Respond ONLY with a valid JSON object. No preamble, no markdown, no explanation outside the JSON.\n"
+        "Schema:\n"
+        '{"ok": true, "problem": "one sentence explaining what is wrong", "fix": "the better reply to send"}\n'
+        "OR if the draft is already good:\n"
+        '{"ok": false, "problem": "", "fix": ""}'
+    )
+
+    user_content = (
+        "Today: " + today + "\n\n"
+        "THREAD:\n" + thread_section + "\n\n"
+        "USER'S CURRENT DRAFT:\n---\n" + draft.strip() + "\n---\n\n"
+        "Is this draft appropriate for the situation? Reply with JSON only."
+    )
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": user_content}
+    ]
+
+# ── Groq caller ───────────────────────────────────────────────────────────────
+
+async def call_groq(messages: list[dict], max_tokens: int = 1024) -> str:
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="Groq API key not configured.")
 
@@ -147,7 +202,7 @@ async def call_groq(messages: list[dict]) -> str:
             },
             json={
                 "model": "llama-3.3-70b-versatile",
-                "max_tokens": 1024,
+                "max_tokens": max_tokens,
                 "temperature": 0.3,
                 "messages": messages
             }
@@ -161,6 +216,8 @@ async def call_groq(messages: list[dict]) -> str:
         raise HTTPException(status_code=502, detail=msg)
 
     return response.json()["choices"][0]["message"]["content"]
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
@@ -265,8 +322,44 @@ async def fix_email(
 
     today = datetime.now().strftime("%A, %B %d %Y")
     messages = build_prompt(body.thread or "", body.draft or "", today)
-    result = await call_groq(messages)
+    result = await call_groq(messages, max_tokens=1024)
     return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
+
+
+@app.post("/coach", response_model=CoachResponse)
+@limiter.limit("60/minute")
+async def coach_email(
+    request: Request,
+    body: CoachRequest,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Live tone coaching — called on every draft keystroke (debounced on client).
+    Does NOT count against the user's daily fix limit.
+    Returns { ok, problem, fix } — ok=True means an issue was found.
+    """
+    if not body.draft or len(body.draft.strip()) < 20:
+        return CoachResponse(ok=False, problem="", fix="")
+
+    today = datetime.now().strftime("%A, %B %d %Y")
+    messages = build_coach_prompt(body.thread or "", body.draft, today)
+
+    raw = await call_groq(messages, max_tokens=300)
+
+    # Parse JSON response from the model
+    try:
+        # Strip any accidental markdown fences
+        cleaned = raw.strip().strip("```json").strip("```").strip()
+        data = json.loads(cleaned)
+        return CoachResponse(
+            ok=bool(data.get("ok", False)),
+            problem=str(data.get("problem", "")),
+            fix=str(data.get("fix", ""))
+        )
+    except (json.JSONDecodeError, KeyError):
+        # If parsing fails, silently return no-issue so we don't show a broken card
+        return CoachResponse(ok=False, problem="", fix="")
+
 
 @app.get("/usage")
 async def get_usage(user: dict = Depends(get_current_user)):
