@@ -153,60 +153,47 @@ SUGGESTED REPLY:
 
 
 def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
-    """
-    Takes the user's draft and returns ONE polished version of it.
-
-    Critical behaviours:
-    - Study the thread's FORMAT: does it end with 'Thanks', 'Regards', a phone number,
-      sign-off, or nothing? Does it use bullet points? Short sentences or long paragraphs?
-      Casual 'hey' openers or formal 'Dear'? Mirror all of that exactly.
-    - Study the thread's TONE: is it a close colleague, a client, a boss, a stranger?
-      Casual banter? Formal business? Tense escalation? Match it.
-    - Keep the user's intent word-for-word where possible. Only change HOW it sounds.
-    - Never add things that weren't in the draft (don't invent apologies, offers, or promises).
-    - If the draft is already perfect for the situation — return it unchanged.
-    """
     thread_section = thread.strip() if thread.strip() else "No prior thread — this is the opening message."
 
     system_content = (
-        "You are ThinkMail's silent writing polish engine.\n"
+        "You are ThinkMail's writing polish engine.\n"
         "Today: " + today + "\n\n"
 
-        "YOUR JOB:\n"
-        "Read the full email thread and the user's current draft. "
-        "Return the best version of that draft — same message, better delivery.\n\n"
+        "YOUR ONLY JOB: take the user's draft and return the BEST version of it for this specific situation.\n\n"
 
-        "STEP 1 — READ THE THREAD FORMAT:\n"
-        "Before touching the draft, study every email in the thread and extract:\n"
-        "- Sign-off style: 'Thanks', 'Regards', 'Cheers', name only, phone number, nothing?\n"
-        "- Opener style: 'Hey [name]', 'Hi', 'Dear', no opener at all?\n"
-        "- Length: short 2-3 line replies, or long paragraphs?\n"
-        "- Formality: casual friend, professional colleague, senior exec, client?\n"
-        "- Any recurring elements: bullet points, numbered lists, specific phrases they always use?\n\n"
+        "STEP 1 — STUDY THE THREAD HISTORY CAREFULLY:\n"
+        "Read every email in the thread and note EXACTLY:\n"
+        "- How does the other person open their emails? ('Hey', 'Hi [name]', 'Dear', straight to the point?)\n"
+        "- How do they sign off? ('Thanks', 'Regards', 'Cheers', their name, phone number, nothing?)\n"
+        "- How long are their replies? (1 line, 3 lines, full paragraphs?)\n"
+        "- What is the relationship? (close colleague, boss, client, stranger, friend?)\n"
+        "- What is the vibe? (casual banter, professional, tense, urgent, friendly?)\n"
+        "- Any specific formatting? (bullet points, numbered steps, line breaks between topics?)\n\n"
 
-        "STEP 2 — POLISH THE DRAFT:\n"
-        "Rewrite the user's draft to:\n"
-        "- Match exactly the format and sign-off style you found in STEP 1.\n"
-        "- Correct the tone if it's too weak, too aggressive, or off for the relationship.\n"
-        "- Sound like a confident, real human. No filler, no corporate speak.\n"
-        "- Keep every point the user made. Do not add new content or promises.\n\n"
+        "STEP 2 — REWRITE THE USER'S DRAFT:\n"
+        "- Mirror the EXACT format and sign-off style from STEP 1. If the thread ends with 'Thanks, [Name]' — do that. If it's casual with no sign-off — do that. If there's a phone number — include it.\n"
+        "- Fix the tone to match the relationship and situation. If the draft is too aggressive, soften it. If it's too weak or apologetic for the situation, strengthen it.\n"
+        "- Keep the user's core message and intent. Do not add promises, apologies, or content that wasn't in the draft.\n"
+        "- Sound like a real confident human. No corporate filler, no 'I hope this email finds you well'.\n\n"
 
-        "STEP 3 — WRITE THE NOTE:\n"
-        "One short sentence (max 12 words) saying what you changed and why.\n"
-        "Examples: 'Matched casual tone and added sign-off from thread history'\n"
-        "          'Removed apologetic opener — thread context doesn't warrant it'\n"
-        "          'Kept formal format consistent with previous emails in thread'\n"
-        "If nothing needed changing, leave note as empty string.\n\n"
+        "STEP 3 — ONE LINE NOTE:\n"
+        "Write ONE sentence (max 12 words) explaining what you changed. Examples:\n"
+        "  'Matched casual tone and sign-off style from thread'\n"
+        "  'Softened aggressive opener — relationship is professional'\n"
+        "  'Added Regards sign-off consistent with thread history'\n"
+        "If the draft was already perfect, return it unchanged and leave note empty.\n\n"
 
-        "OUTPUT: valid JSON only. No markdown, no explanation outside the JSON.\n"
-        '{"improved": "the polished reply", "note": "one line or empty"}'
+        "CRITICAL: Output ONLY valid JSON. No markdown fences, no explanation, nothing else.\n"
+        '{"improved": "full rewritten reply here", "note": "one line or empty string"}' 
     )
 
     user_content = (
         "Today: " + today + "\n\n"
-        "FULL THREAD:\n" + thread_section + "\n\n"
-        "USER'S DRAFT:\n---\n" + draft.strip() + "\n---\n\n"
-        "Return the polished version. JSON only."
+        "=== FULL EMAIL THREAD (study this carefully) ===\n"
+        + thread_section +
+        "\n\n=== USER'S CURRENT DRAFT ===\n"
+        + draft.strip() +
+        "\n\nReturn ONLY the JSON object with the improved reply."
     )
 
     return [
