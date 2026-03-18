@@ -1,9 +1,8 @@
 """
-ThinkMail Backend
-Fixes what you meant to say, not just how you said it.
+MailMind Backend
 - Google OAuth login
-- Groq API proxy with contextual + social risk analysis
-- Supabase for user tracking
+- Groq API proxy
+- Supabase database for user tracking
 - Zero email logging
 """
 
@@ -37,7 +36,7 @@ FREE_TIER_LIMIT      = int(os.getenv("FREE_TIER_LIMIT", "20"))
 
 # ── App ───────────────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="ThinkMail API", version="1.0.0")
+app = FastAPI(title="MailMind API", version="1.0.0")
 app.state.limiter = limiter
 
 app.add_middleware(
@@ -53,11 +52,11 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"error": "Too many requests."})
 
 # ── Models ────────────────────────────────────────────────────────────────────
-class AnalyzeRequest(BaseModel):
+class FixRequest(BaseModel):
     thread: Optional[str] = ""
     draft: Optional[str] = ""
 
-class AnalyzeResponse(BaseModel):
+class FixResponse(BaseModel):
     result: str
     fixes_used: int
     fixes_remaining: int
@@ -87,78 +86,72 @@ def get_current_user(request: Request) -> dict:
 # ── Groq helper ───────────────────────────────────────────────────────────────
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
     draft_section = (
-        f"USER'S DRAFT REPLY:\n---\n{draft}\n---"
+        f"USER'S DRAFT REPLY:
+---
+{draft}
+---"
         if draft.strip()
-        else "USER'S DRAFT REPLY: None — generate the right reply entirely from context."
+        else "USER'S DRAFT REPLY: None — the user hasn't typed anything. Write the reply from scratch based on the full thread context."
     )
 
     if not thread.strip() and not draft.strip():
-        content = "Tell the user to open an email thread in Gmail first."
-    elif not thread.strip():
-        content = f"Review this draft and flag any social or contextual risks.\n\n{draft_section}"
+        content = "Tell the user to open a Gmail thread first."
     else:
         content = f"""Today's date: {today}
 
-FULL EMAIL THREAD (oldest to newest):
----
-{thread}
----
+{thread if thread.strip() else "No thread found — only a draft is available."}
 
 {draft_section}
 
-You are an assistant that detects social and contextual risks in emails.
-Analyze completely and respond in EXACTLY this format:
+You are ThinkMail. Read every single email in the thread above carefully before responding.
+Understand who said what, when, what was promised, what changed, and what the current situation actually is.
+
+Respond in EXACTLY this format — nothing outside these sections:
+
+TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
+URGENCY: [one word: Low / Medium / High]
+VIBE: [one word: Positive / Neutral / Tense / Hostile / Warm]
+INTENT: [one short phrase — what does the other person actually want from this email?]
+RISK: [one word: Low / Medium / High — how risky is it to reply wrong here?]
 
 SITUATION:
-[2-3 sentences: what is actually happening, who said what, what was agreed or promised, what is the relationship tone — conflict, follow-up, casual, professional, tense, etc.]
+[3-4 plain English sentences. Summarize the ENTIRE thread history — not just the last email. Who are the people involved? What has been said across all emails? What is the actual current situation? Write like you're explaining it to a friend who hasn't read any of it.]
 
-SOCIAL RISKS:
-[Specific risks in how this message may land socially:
-- Could it come across as passive-aggressive, cold, dismissive, or presumptuous?
-- Is there missing acknowledgment the recipient will notice?
-- Is the tone wrong for this relationship (too formal, too casual, too blunt)?
-- Could it damage the relationship even if technically correct?
-If none, say "No social risks detected."]
+CONTEXT ANALYSIS:
+[What is the deeper context here? Is there a power dynamic? Has anything been promised and not delivered? Is the tone of the thread changing — friendly at first, now tense? What should the user be aware of before replying? Be specific and reference actual things said in the thread.]
 
-CONTEXT ISSUES:
-[Factual or logical problems in the draft vs. the thread:
-- Does it agree to the wrong deadline?
-- Does it ignore something directly asked?
-- Does it contradict a prior commitment?
-- Does it miss the actual point of the last message?
-If none, say "No context issues detected."]
+CONFLICTS:
+[Look across the ENTIRE thread. Did someone make a promise they're now contradicting? Is the user's draft ignoring something important that was said earlier? Is someone moving goalposts? If the draft contradicts the thread, call it out specifically. If nothing is wrong say exactly: No conflicts detected.]
 
 SUGGESTED REPLY:
-[The reply the user should actually send.
-- Fix the meaning errors first, tone second.
-- If the other party is contradicting a prior agreement, reference it specifically and call it out professionally.
-- Never write a sycophantic or pushover reply.
-- No filler openers like "Hope this finds you well."
-- Sound like a real, confident human.
-- Match the appropriate formality for the relationship.]"""
+[Write the reply the user should actually send. Rules:
+- Read the ENTIRE thread before writing this — the reply must make sense given everything that was said
+- Sound like a real human, not an AI — no corporate speak, no filler
+- Match the exact tone of the conversation — casual threads get casual replies
+- Never start with "I hope this email finds you well" or any opener like that
+- If the other person is wrong or contradicting something they said earlier, the reply should address that directly
+- If no draft was provided, write the complete reply from scratch
+- Be concise — every sentence should earn its place
+- Never be a pushover]"""
 
     return [
-        {
+        {{
             "role": "system",
-            "content": f"""You are ThinkMail — an email context and social intelligence assistant.
+            "content": f"""You are ThinkMail — an email situational intelligence assistant.
 Today's date is {today}.
 
-Your job: fix what the user MEANS to say, not just how they say it.
-
-Most email tools catch spelling and grammar. You catch:
-- Agreeing to the wrong deadline
-- Ignoring what was actually asked
-- Contradicting something said three emails ago
-- Passive-aggressive or cold tone the user didn't intend
-- Missing acknowledgment that will make the recipient feel dismissed
-- Replies that are technically correct but socially damaging
+Your core job: Read the FULL email thread. Understand the complete history and context — not just the latest message. Catch what's contextually wrong even if it's grammatically fine.
 
 You are on the USER's side. Always.
-Be specific. Vague feedback is useless. Reference exact quotes from the thread.
-Never suggest sycophantic replies. Sound like a real human advisor who reads emails carefully."""
-        },
-        {"role": "user", "content": content}
+You think like a smart friend who read every email in the chain.
+You catch timeline conflicts, broken promises, power dynamics, and meaning errors.
+You write replies that sound human — confident, direct, appropriate.
+You never generate generic AI text. You never suggest pushover replies.
+You always follow the exact output format — every section, every time."""
+        }},
+        {{"role": "user", "content": content}}
     ]
+
 
 async def call_groq(messages: list[dict]) -> str:
     if not GROQ_API_KEY:
@@ -173,7 +166,7 @@ async def call_groq(messages: list[dict]) -> str:
             },
             json={
                 "model": "llama-3.3-70b-versatile",
-                "max_tokens": 1200,
+                "max_tokens": 1024,
                 "temperature": 0.3,
                 "messages": messages
             }
@@ -182,7 +175,7 @@ async def call_groq(messages: list[dict]) -> str:
     if response.status_code != 200:
         try:
             msg = response.json().get("error", {}).get("message", "Groq API error")
-        except Exception:
+        except:
             msg = f"Groq API error ({response.status_code})"
         raise HTTPException(status_code=502, detail=msg)
 
@@ -192,7 +185,7 @@ async def call_groq(messages: list[dict]) -> str:
 
 @app.get("/")
 async def root():
-    return {"status": "ThinkMail API is running", "version": "1.0.0"}
+    return {"status": "MailMind API is running", "version": "1.0.0"}
 
 @app.get("/health")
 async def health():
@@ -244,9 +237,10 @@ async def auth_callback(code: str, request: Request):
         user_info = user_response.json()
 
     user_id = hashlib.sha256(user_info["email"].encode()).hexdigest()[:16]
-    name  = user_info.get("name", "")
+    name = user_info.get("name", "")
     email = user_info["email"]
 
+    # Save user to Supabase
     await upsert_user(email=email, name=name, user_id=user_id)
 
     jwt_token = create_jwt(user_id, email, name)
@@ -261,7 +255,7 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
     html = f"""<!DOCTYPE html>
 <html>
 <head>
-<title>ThinkMail — Signed in!</title>
+<title>MailMind — Signed in!</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
@@ -270,32 +264,36 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
     height: 100vh; background: #111214; color: #e8eaed;
     flex-direction: column; gap: 14px; text-align: center; padding: 24px;
   }}
-  .icon {{ width: 56px; height: 56px; border-radius: 16px; overflow: hidden; margin-bottom: 4px; }}
-  .icon img {{ width: 100%; height: 100%; object-fit: cover; }}
+  .icon {{ width: 56px; height: 56px; border-radius: 16px; background: linear-gradient(135deg, #EA4335, #4285F4); display: flex; align-items: center; justify-content: center; font-size: 24px; margin-bottom: 4px; }}
   h2 {{ font-size: 20px; font-weight: 600; }}
   p {{ color: #9aa0a6; font-size: 14px; line-height: 1.6; }}
   .email {{ color: #4285F4; font-size: 13px; }}
 </style>
 </head>
 <body>
-<div class="icon"><img src="/static/icon.png" alt="ThinkMail"></div>
+<div class="icon">✦</div>
 <h2>Signed in successfully!</h2>
 <div class="email">{email}</div>
-<p>You can close this tab and go back to Gmail.<br>ThinkMail is ready to use.</p>
+<p>You can close this tab and go back to Gmail.<br>MailMind is ready to use.</p>
 <script>
+  try {{
+    localStorage.setItem('mailmind_token', '{token}');
+    localStorage.setItem('mailmind_name', '{name}');
+    localStorage.setItem('mailmind_email', '{email}');
+  }} catch(e) {{}}
   setTimeout(() => window.close(), 3000);
 </script>
 </body>
 </html>"""
     return HTMLResponse(html)
 
-# ── Analyze endpoint ──────────────────────────────────────────────────────────
+# ── Fix endpoint ──────────────────────────────────────────────────────────────
 
-@app.post("/analyze", response_model=AnalyzeResponse)
+@app.post("/fix", response_model=FixResponse)
 @limiter.limit("30/minute")
-async def analyze_email(
+async def fix_email(
     request: Request,
-    body: AnalyzeRequest,
+    body: FixRequest,
     user: dict = Depends(get_current_user)
 ):
     """PRIVACY: Email content is NEVER logged or stored."""
@@ -310,21 +308,12 @@ async def analyze_email(
     messages = build_prompt(body.thread or "", body.draft or "", today)
     result = await call_groq(messages)
 
-    return AnalyzeResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
-
-# Keep /fix as alias for backwards compatibility
-@app.post("/fix", response_model=AnalyzeResponse)
-@limiter.limit("30/minute")
-async def fix_email(
-    request: Request,
-    body: AnalyzeRequest,
-    user: dict = Depends(get_current_user)
-):
-    return await analyze_email(request, body, user)
+    return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
 
 @app.get("/usage")
 async def get_usage(user: dict = Depends(get_current_user)):
-    return await get_user_stats(user["sub"])
+    stats = await get_user_stats(user["sub"])
+    return stats
 
 @app.get("/me")
 async def get_me(user: dict = Depends(get_current_user)):
