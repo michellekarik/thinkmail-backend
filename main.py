@@ -245,7 +245,7 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
         "try{localStorage.setItem('mailmind_token','" + token + "');"
         "localStorage.setItem('mailmind_name','" + name + "');"
         "localStorage.setItem('mailmind_email','" + email + "');}catch(e){}"
-        "setTimeout(()=>window.close(),3000);"
+        "setTimeout(()=>{window.location.href='https://mail.google.com';},2000);"
         "</script></body></html>"
     )
     return HTMLResponse(html)
