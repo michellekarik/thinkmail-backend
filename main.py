@@ -137,9 +137,11 @@ async def get_fallback_reply(thread: str, draft: str, today: str) -> str:
         "You are ThinkMail. Today: " + today + "\n\n"
         "EMAIL THREAD:\n" + (thread.strip() or "No thread available.") + "\n\n"
         + ("USER DRAFT:\n" + draft.strip() + "\n\n" if has_draft else "")
-        + "Write the best possible reply to this email thread. "
-        + ("Improve and complete the user's draft. " if has_draft else "Write from scratch. ")
+        + "IMPORTANT: The user is the person who needs to REPLY — NOT the person who sent the last message. "
+        + "The last message was sent TO the user. Write the reply FROM the user, TO the other person. "
+        + "Open with the OTHER person's name. Sign off with the USER's name. "
         + "Match the format, opener, sign-off, length and tone of the thread history exactly. "
+        + ("Improve and complete the user's draft. " if has_draft else "Write from scratch. ")
         + "Sound like a confident real human. Return ONLY the reply text, nothing else."
     )
     messages = [{"role": "user", "content": prompt}]
@@ -174,10 +176,29 @@ Study every email in the thread and note exactly:
 - Sign-off: Thanks [name], Regards, Cheers, name only, phone number, or nothing?
 - Length: short punchy lines or full paragraphs?
 - Formality: close friend, colleague, boss, client, stranger?
-- Any recurring patterns: bullet points, line breaks, specific phrases?
-The SUGGESTED REPLY must mirror this format exactly. This is non-negotiable.
+- Any recurring patterns: bullet points, line breaks, specific phrases they always use?
 
-STEP 2 — RESPOND IN THIS EXACT FORMAT. ALL SECTIONS ARE MANDATORY. DO NOT SKIP ANY:
+FORMAT RULE — non-negotiable:
+If there IS a back-and-forth history between these two people in the thread:
+  → The SUGGESTED REPLY must mirror that exact format. Same opener, same sign-off, same length, same tone.
+  → Example: if every email ends "Thanks, Priya" — end with that. If they write short 2-line replies — do that.
+  → Never invent a format that does not already exist in their history.
+
+If this is the FIRST email or there is NO prior reply history (only one email in the thread):
+  → Use a clean professional default: opener with the person's name, clear body, sign off with the user's name.
+  → Match the formality level of the incoming email — if they wrote formally, reply formally. If casual, casual.
+  → Example default format:
+     Hi [Name],
+     [Body of reply]
+     Thanks,
+     [User's name]
+
+STEP 2 — IDENTIFY WHO IS WHO:
+The person who sent the LAST message in the thread is the OTHER person — not the user.
+The user is whoever needs to REPLY. Look at earlier emails to find the user's name and sign-off style.
+The SUGGESTED REPLY opens with the OTHER person's name and signs off with the USER's name.
+
+STEP 3 — RESPOND IN THIS EXACT FORMAT. ALL SECTIONS ARE MANDATORY. DO NOT SKIP ANY:
 
 TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
 URGENCY: [one word: Low / Medium / High]
@@ -202,18 +223,32 @@ FORMAT RULE — non-negotiable: match the exact opener, sign-off, length and for
 Sound like a confident real human. No filler. No pushover replies.]"""
         )
 
+    # Figure out who the user is from the last email they sent in the thread
+    # The user is the person who RECEIVES the most recent message and needs to reply
+    user_identity_instruction = (
+        "CRITICAL — WHO IS THE USER:\n"
+        "The USER is the person reading this right now who needs to send a reply. "
+        "They are NOT the person who sent the last message. "
+        "The last message in the thread was sent TO the user — the user needs to reply TO that person. "
+        "Read the thread carefully to identify who the user is (they will appear as a sender in earlier emails). "
+        "The SUGGESTED REPLY must be written FROM the user, TO the other person. "
+        "Open with the OTHER person's name. Sign off with the USER's name. Never mix these up.\n\n"
+    )
+
     system_content = (
         "You are ThinkMail — email situational intelligence.\n"
         "Today: " + today + "\n\n"
+        + user_identity_instruction +
         "Rules you never break:\n"
         "1. Read the FULL thread — every email, not just the last one.\n"
-        "2. You are on the USER's side. Always.\n"
+        "2. You are on the USER's side. Always. Write the reply AS the user, TO the other person.\n"
         "3. If the user typed a draft, understand what they meant and say it right for this situation.\n"
-        "4. SUGGESTED REPLY is ALWAYS required. You must write it every single time without exception. "
-        "Even if the thread is short, even if there is no draft — you always write the reply.\n"
-        "5. The SUGGESTED REPLY must match the format of this specific email relationship — "
-        "same opener, same sign-off, same length, same formality as the thread history.\n"
-        "6. Sound like a real human who knows this person. No generic AI text.\n"
+        "4. SUGGESTED REPLY is ALWAYS required. You must write it every single time without exception.\n"
+        "5. FORMAT RULE: If there is back-and-forth history — mirror it exactly: same opener, "
+        "same sign-off, same length, same formality. If it is the first email or no prior replies exist — "
+        "use a clean professional default matching the formality of the incoming email: "
+        "opener with their name, clear body, sign off with user's name.\n"
+        "6. Sound like a real human. No generic AI text.\n"
         "Always follow the exact output format. All six sections are mandatory."
     )
 
