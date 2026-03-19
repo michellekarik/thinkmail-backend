@@ -198,7 +198,13 @@ The person who sent the LAST message in the thread is the OTHER person — not t
 The user is whoever needs to REPLY. Look at earlier emails to find the user's name and sign-off style.
 The SUGGESTED REPLY opens with the OTHER person's name and signs off with the USER's name.
 
-STEP 3 — RESPOND IN THIS EXACT FORMAT. ALL SECTIONS ARE MANDATORY. DO NOT SKIP ANY:
+STEP 3 — DETECT LANGUAGE:
+If the user typed a draft — check what language it is in.
+If the draft is in Hindi, Japanese, Spanish, Tamil, French, or any non-English language — write the SUGGESTED REPLY in that exact language.
+If the draft is in English or there is no draft — write the SUGGESTED REPLY in English.
+TONE, URGENCY, VIBE, INTENT, RISK, SITUATION, CONTEXT ANALYSIS, CONFLICTS are always in English.
+
+STEP 4 — RESPOND IN THIS EXACT FORMAT. ALL SECTIONS ARE MANDATORY. DO NOT SKIP ANY:
 
 TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
 URGENCY: [one word: Low / Medium / High]
@@ -233,6 +239,14 @@ Sound like a confident real human. No filler. No pushover replies.]"""
         "Read the thread carefully to identify who the user is (they will appear as a sender in earlier emails). "
         "The SUGGESTED REPLY must be written FROM the user, TO the other person. "
         "Open with the OTHER person's name. Sign off with the USER's name. Never mix these up.\n\n"
+
+        "LANGUAGE RULE:\n"
+        "If the user has typed a draft, detect what language it is written in.\n"
+        "- If the draft is in a non-English language (Hindi, Japanese, Spanish, French, Tamil, etc.) "
+        "— write the SUGGESTED REPLY in that same language.\n"
+        "- If the draft is in English or there is no draft — write the SUGGESTED REPLY in English.\n"
+        "- All other sections (TONE, URGENCY, VIBE, INTENT, RISK, SITUATION, CONTEXT ANALYSIS, CONFLICTS) "
+        "must always be in English regardless of the reply language.\n\n"
     )
 
     system_content = (
