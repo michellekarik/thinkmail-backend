@@ -97,8 +97,6 @@ def get_current_user(request: Request) -> dict:
 
 
 # ── Groq caller ───────────────────────────────────────────────────────────────
-# model param lets /fix use the big accurate model,
-# while /coach uses llama-3.1-8b-instant (5-10x faster, good enough for polish)
 
 async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "llama-3.3-70b-versatile") -> str:
     if not GROQ_API_KEY:
@@ -127,6 +125,25 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "
         raise HTTPException(status_code=502, detail=msg)
 
     return response.json()["choices"][0]["message"]["content"]
+
+
+# ── Fallback reply generator ──────────────────────────────────────────────────
+# If the model skips SUGGESTED REPLY, call it again just for the reply.
+# This guarantees a reply is ALWAYS returned — no exceptions.
+
+async def get_fallback_reply(thread: str, draft: str, today: str) -> str:
+    has_draft = draft.strip()
+    prompt = (
+        "You are ThinkMail. Today: " + today + "\n\n"
+        "EMAIL THREAD:\n" + (thread.strip() or "No thread available.") + "\n\n"
+        + ("USER DRAFT:\n" + draft.strip() + "\n\n" if has_draft else "")
+        + "Write the best possible reply to this email thread. "
+        + ("Improve and complete the user's draft. " if has_draft else "Write from scratch. ")
+        + "Match the format, opener, sign-off, length and tone of the thread history exactly. "
+        + "Sound like a confident real human. Return ONLY the reply text, nothing else."
+    )
+    messages = [{"role": "user", "content": prompt}]
+    return await call_groq(messages, max_tokens=512, model="llama-3.3-70b-versatile")
 
 
 # ── /fix prompt ───────────────────────────────────────────────────────────────
@@ -158,9 +175,9 @@ Study every email in the thread and note exactly:
 - Length: short punchy lines or full paragraphs?
 - Formality: close friend, colleague, boss, client, stranger?
 - Any recurring patterns: bullet points, line breaks, specific phrases?
-The SUGGESTED REPLY must mirror this format exactly. Non-negotiable.
+The SUGGESTED REPLY must mirror this format exactly. This is non-negotiable.
 
-STEP 2 — RESPOND IN THIS EXACT FORMAT:
+STEP 2 — RESPOND IN THIS EXACT FORMAT. ALL SECTIONS ARE MANDATORY. DO NOT SKIP ANY:
 
 TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
 URGENCY: [one word: Low / Medium / High]
@@ -172,17 +189,17 @@ SITUATION:
 [3-4 plain English sentences. What is happening? Who are these people, what is the history, what is the current moment?]
 
 CONTEXT ANALYSIS:
-[Power dynamic, tone shifts, promises made or broken, what the user must know before replying. Reference specific things said in the thread.]
+[Power dynamic, tone shifts, promises made or broken, what the user must understand before replying.]
 
 CONFLICTS:
 [Did the user's draft miss or contradict something from the thread? Is their tone wrong for this relationship? If nothing is wrong: No conflicts detected.]
 
 SUGGESTED REPLY:
-[Write the reply the user should actually send.
+[MANDATORY — you must always write this. Never skip it under any circumstances.
 If they typed a draft: keep their intent, fix the delivery for this situation.
-If no draft: write from scratch.
-FORMAT RULE — non-negotiable: match the exact opener, sign-off, length and formality from the thread history. If emails in this thread end with "Thanks, Michelle" use that. If casual with no sign-off, do that. If they always write short 2-line replies, do that. Never invent a format that doesn't exist in the history.
-Sound like a confident real human. Never a pushover. No filler openers.]"""
+If no draft: write from scratch based on the full thread.
+FORMAT RULE — non-negotiable: match the exact opener, sign-off, length and formality from the thread history. If emails end with "Thanks, Priya" use that. If casual with no sign-off, do that. Never invent a format that does not exist in the history.
+Sound like a confident real human. No filler. No pushover replies.]"""
         )
 
     system_content = (
@@ -192,12 +209,12 @@ Sound like a confident real human. Never a pushover. No filler openers.]"""
         "1. Read the FULL thread — every email, not just the last one.\n"
         "2. You are on the USER's side. Always.\n"
         "3. If the user typed a draft, understand what they meant and say it right for this situation.\n"
-        "4. The SUGGESTED REPLY must always match the format of this specific email relationship — "
-        "same opener, same sign-off, same length, same formality as the thread history. "
-        "If the thread uses 'Thanks, [name]' use that. If it is casual with no sign-off, do that. "
-        "Never invent a format that does not match the history.\n"
-        "5. Sound like a real human who knows this person. No generic AI text.\n"
-        "Always follow the exact output format."
+        "4. SUGGESTED REPLY is ALWAYS required. You must write it every single time without exception. "
+        "Even if the thread is short, even if there is no draft — you always write the reply.\n"
+        "5. The SUGGESTED REPLY must match the format of this specific email relationship — "
+        "same opener, same sign-off, same length, same formality as the thread history.\n"
+        "6. Sound like a real human who knows this person. No generic AI text.\n"
+        "Always follow the exact output format. All six sections are mandatory."
     )
 
     return [
@@ -205,6 +222,8 @@ Sound like a confident real human. Never a pushover. No filler openers.]"""
         {"role": "user", "content": user_content}
     ]
 
+
+# ── /coach prompt ─────────────────────────────────────────────────────────────
 
 def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
     thread_section = thread.strip() if thread.strip() else "No prior thread."
@@ -221,7 +240,7 @@ def build_coach_prompt(thread: str, draft: str, today: str) -> list[dict]:
         "Return ONLY valid JSON, no markdown, no explanation:\n"
         '{"what_was_wrong":"one sentence diagnosis or empty if fine",'
         '"improved":"full rewritten reply",'
-        '"note":"what changed, e.g. matched casual tone added sign-off or empty"}'
+        '"note":"what changed or empty"}'
     )
 
     user_content = (
@@ -341,8 +360,17 @@ async def fix_email(
 
     today    = datetime.now().strftime("%A, %B %d %Y")
     messages = build_prompt(body.thread or "", body.draft or "", today)
-    # Full analysis uses the big accurate model
-    result   = await call_groq(messages, max_tokens=1024, model="llama-3.3-70b-versatile")
+    result   = await call_groq(messages, max_tokens=1200, model="llama-3.3-70b-versatile")
+
+    # ── Guarantee a reply is always present ──────────────────────────────────
+    # If the model skipped SUGGESTED REPLY for any reason, call again just for it
+    reply_match = __import__('re').search(r'SUGGESTED REPLY:\s*([\s\S]*)', result, __import__('re').IGNORECASE)
+    reply_text  = reply_match.group(1).strip() if reply_match else ""
+
+    if not reply_text:
+        fallback = await get_fallback_reply(body.thread or "", body.draft or "", today)
+        result = result.rstrip() + "\n\nSUGGESTED REPLY:\n" + fallback
+
     return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
 
 
@@ -353,17 +381,11 @@ async def coach_email(
     body: CoachRequest,
     user: dict = Depends(get_current_user)
 ):
-    """
-    Live draft coach — called once when user pauses typing.
-    Uses llama-3.1-8b-instant: 5-10x faster than 70b, sub-2s responses.
-    Does NOT count against daily fix quota.
-    """
     if not body.draft or len(body.draft.strip()) < 3:
         return CoachResponse(improved="", note="", what_was_wrong="")
 
     today    = datetime.now().strftime("%A, %B %d %Y")
     messages = build_coach_prompt(body.thread or "", body.draft, today)
-    # Fast model for real-time coaching
     raw      = await call_groq(messages, max_tokens=350, model="llama-3.1-8b-instant")
 
     try:
