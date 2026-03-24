@@ -373,35 +373,19 @@ async def auth_callback(code: str, request: Request):
 
     await upsert_user(email=email, name=name, user_id=user_id)
     jwt_token = create_jwt(user_id, email, name)
-    return RedirectResponse(
-        FRONTEND_URL + "/auth/extension-callback?token=" + jwt_token +
-        "&name=" + name + "&email=" + email
-    )
+    # Go DIRECTLY to Gmail with token in the URL hash.
+    # background.js on mail.google.com picks this up and saves to chrome.storage.local.
+    import urllib.parse as _up
+    params = _up.urlencode({"tm_token": jwt_token, "tm_name": name, "tm_email": email})
+    return RedirectResponse(f"https://mail.google.com/#thinkmail-auth?{params}")
+
 
 @app.get("/auth/extension-callback")
 async def extension_callback(token: str, name: str = "", email: str = ""):
-    html = (
-        "<!DOCTYPE html><html><head><title>ThinkMail</title>"
-        "<style>*{box-sizing:border-box;margin:0;padding:0}"
-        "body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;"
-        "height:100vh;background:#0d0f10;color:#edf0f2;flex-direction:column;gap:14px;"
-        "text-align:center;padding:24px}"
-        ".icon{width:52px;height:52px;border-radius:14px;"
-        "background:linear-gradient(135deg,#4285F4,#34A853);display:flex;"
-        "align-items:center;justify-content:center;font-size:22px;margin-bottom:4px}"
-        "h2{font-size:20px;font-weight:600}p{color:#8d9499;font-size:13px;line-height:1.6}"
-        ".em{color:#4285F4;font-size:13px}</style></head><body>"
-        "<div class='icon'>✦</div><h2>Signed in!</h2>"
-        "<div class='em'>" + email + "</div>"
-        "<p>You can close this tab and go back to Gmail.</p>"
-        "<script>"
-        "try{localStorage.setItem('mailmind_token','" + token + "');"
-        "localStorage.setItem('mailmind_name','" + name + "');"
-        "localStorage.setItem('mailmind_email','" + email + "');}catch(e){}"
-        "setTimeout(()=>{window.location.href='https://mail.google.com';},2000);"
-        "</script></body></html>"
-    )
-    return HTMLResponse(html)
+    # Legacy route kept for backwards compat
+    import urllib.parse as _up
+    params = _up.urlencode({"tm_token": token, "tm_name": name, "tm_email": email})
+    return RedirectResponse(f"https://mail.google.com/#thinkmail-auth?{params}")
 
 
 @app.post("/fix", response_model=FixResponse)
