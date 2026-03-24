@@ -34,6 +34,20 @@ FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:8000")
 REDIRECT_URI         = os.getenv("REDIRECT_URI", "http://localhost:8000/auth/callback")
 FREE_TIER_LIMIT      = int(os.getenv("FREE_TIER_LIMIT", "50"))
 
+# FIX: These were missing — caused NameError in /track/{id}.png endpoint
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")  # use your actual env var name
+
+
+def get_headers():
+    """Supabase REST API auth headers."""
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": "Bearer " + SUPABASE_KEY,
+        "Content-Type": "application/json"
+    }
+
+
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="ThinkMail API", version="1.0.0")
 app.state.limiter = limiter
@@ -55,20 +69,20 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 class FixRequest(BaseModel):
     thread: Optional[str] = ""
-    draft: Optional[str] = ""
+    draft:  Optional[str] = ""
 
 class FixResponse(BaseModel):
-    result: str
-    fixes_used: int
+    result:          str
+    fixes_used:      int
     fixes_remaining: int
 
 class CoachRequest(BaseModel):
     thread: Optional[str] = ""
-    draft: Optional[str] = ""
+    draft:  Optional[str] = ""
 
 class CoachResponse(BaseModel):
-    improved: str
-    note: str
+    improved:       str
+    note:           str
     what_was_wrong: str
 
 
@@ -76,10 +90,10 @@ class CoachResponse(BaseModel):
 
 def create_jwt(user_id: str, email: str, name: str) -> str:
     payload = {
-        "sub": user_id,
+        "sub":   user_id,
         "email": email,
-        "name": name,
-        "exp": datetime.utcnow() + timedelta(days=30)
+        "name":  name,
+        "exp":   datetime.utcnow() + timedelta(days=30)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -110,10 +124,10 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "
                 "Content-Type": "application/json"
             },
             json={
-                "model": model,
+                "model":      model,
                 "max_tokens": max_tokens,
                 "temperature": 0.3,
-                "messages": messages
+                "messages":   messages
             }
         )
 
@@ -128,8 +142,6 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "
 
 
 # ── Fallback reply generator ──────────────────────────────────────────────────
-# If the model skips SUGGESTED REPLY, call it again just for the reply.
-# This guarantees a reply is ALWAYS returned — no exceptions.
 
 async def get_fallback_reply(thread: str, draft: str, today: str) -> str:
     has_draft = draft.strip()
@@ -229,8 +241,6 @@ FORMAT RULE — non-negotiable: match the exact opener, sign-off, length and for
 Sound like a confident real human. No filler. No pushover replies.]"""
         )
 
-    # Figure out who the user is from the last email they sent in the thread
-    # The user is the person who RECEIVES the most recent message and needs to reply
     user_identity_instruction = (
         "CRITICAL — WHO IS THE USER:\n"
         "The USER is the person reading this right now who needs to send a reply. "
@@ -268,7 +278,7 @@ Sound like a confident real human. No filler. No pushover replies.]"""
 
     return [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": user_content}
+        {"role": "user",   "content": user_content}
     ]
 
 
@@ -337,11 +347,11 @@ async def auth_callback(code: str, request: Request):
         token_response = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
-                "code": code,
-                "client_id": GOOGLE_CLIENT_ID,
+                "code":          code,
+                "client_id":     GOOGLE_CLIENT_ID,
                 "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uri": REDIRECT_URI,
-                "grant_type": "authorization_code"
+                "redirect_uri":  REDIRECT_URI,
+                "grant_type":    "authorization_code"
             }
         )
         if token_response.status_code != 200:
@@ -398,8 +408,8 @@ async def extension_callback(token: str, name: str = "", email: str = ""):
 @limiter.limit("30/minute")
 async def fix_email(
     request: Request,
-    body: FixRequest,
-    user: dict = Depends(get_current_user)
+    body:    FixRequest,
+    user:    dict = Depends(get_current_user)
 ):
     user_id = user["sub"]
     try:
@@ -411,8 +421,7 @@ async def fix_email(
     messages = build_prompt(body.thread or "", body.draft or "", today)
     result   = await call_groq(messages, max_tokens=1200, model="llama-3.3-70b-versatile")
 
-    # ── Guarantee a reply is always present ──────────────────────────────────
-    # If the model skipped SUGGESTED REPLY for any reason, call again just for it
+    # Guarantee a reply is always present
     reply_match = __import__('re').search(r'SUGGESTED REPLY:\s*([\s\S]*)', result, __import__('re').IGNORECASE)
     reply_text  = reply_match.group(1).strip() if reply_match else ""
 
@@ -427,8 +436,8 @@ async def fix_email(
 @limiter.limit("60/minute")
 async def coach_email(
     request: Request,
-    body: CoachRequest,
-    user: dict = Depends(get_current_user)
+    body:    CoachRequest,
+    user:    dict = Depends(get_current_user)
 ):
     if not body.draft or len(body.draft.strip()) < 3:
         return CoachResponse(improved="", note="", what_was_wrong="")
@@ -490,33 +499,46 @@ _PIXEL_GIF = (
 from fastapi.responses import Response as FastAPIResponse
 
 @app.get("/track/{track_id}.png")
-async def track_pixel(track_id: str, request: Request):
+async def track_pixel(track_id: str, r: str = "", request: Request = None):
     """
     Serve a 1×1 transparent pixel and record the first open time.
     Called automatically by the recipient's email client when they open the email.
+
+    The `r` query param is a random nonce injected by content.js to prevent
+    Gmail's image proxy from caching the pixel and blocking repeat-open detection.
     """
-    # Validate track_id — alphanumeric hex only (24 chars from content.js)
     import re as _re
     if not _re.match(r'^[0-9a-f]{24}$', track_id):
         return FastAPIResponse(content=_PIXEL_GIF, media_type="image/gif")
 
-    # Record open in Supabase (only if not already recorded)
+    # FIX: SUPABASE_URL, SUPABASE_KEY and get_headers() are now defined at module level
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                # Upsert: insert if new, ignore if already exists
-                await client.post(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts",
-                    headers={
-                        **get_headers(),
-                        "Prefer": "resolution=ignore-duplicates,return=minimal"
-                    },
-                    json={
-                        "id": track_id,
-                        "opened_at": datetime.utcnow().isoformat(),
-                        "created_at": datetime.utcnow().isoformat()
-                    }
+                # Check if already recorded (avoid overwriting first-open timestamp)
+                check = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&select=opened_at",
+                    headers=get_headers()
                 )
+                already_recorded = (
+                    check.status_code == 200 and
+                    check.json() and
+                    check.json()[0].get("opened_at") is not None
+                )
+
+                if not already_recorded:
+                    await client.post(
+                        f"{SUPABASE_URL}/rest/v1/track_receipts",
+                        headers={
+                            **get_headers(),
+                            "Prefer": "resolution=ignore-duplicates,return=minimal"
+                        },
+                        json={
+                            "id":         track_id,
+                            "opened_at":  datetime.utcnow().isoformat(),
+                            "created_at": datetime.utcnow().isoformat()
+                        }
+                    )
         except Exception:
             pass  # never break pixel delivery
 
@@ -526,7 +548,8 @@ async def track_pixel(track_id: str, request: Request):
         media_type="image/gif",
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache"
+            "Pragma":        "no-cache",
+            "Expires":       "0"
         }
     )
 
