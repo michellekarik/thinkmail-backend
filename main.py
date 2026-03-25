@@ -124,39 +124,18 @@ async def fix_email(request: Request, body: FixRequest, user: dict = Depends(get
 _PIXEL = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
-def _sb_headers():
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("thinkmail")
+
+def _sb():
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
     }
 
-# ── DEBUG: inspect any tracking row ──────────────────────────────────────────
-@app.get("/track/{track_id}/debug")
-async def track_debug(track_id: str, user: dict = Depends(get_current_user)):
-    """Returns the raw Supabase row + recent pixel hits log. Use to diagnose issues."""
-    import re
-    if not re.match(r'^[0-9a-f]{24}$', track_id):
-        raise HTTPException(status_code=400, detail="Invalid track ID")
-    result = {"track_id": track_id, "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY), "row": None, "error": None}
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                res = await client.get(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
-                    headers=_sb_headers(),
-                )
-                result["supabase_status"] = res.status_code
-                result["supabase_body"]   = res.text
-                rows = res.json() if res.status_code == 200 else []
-                result["row"] = rows[0] if rows else None
-                result["row_exists"] = bool(rows)
-        except Exception as e:
-            result["error"] = str(e)
-    return result
 
-
-# ── Register: create the row when email is sent ───────────────────────────────
 @app.post("/track/{track_id}/register")
 async def track_register(track_id: str, user: dict = Depends(get_current_user)):
     import re
@@ -168,56 +147,69 @@ async def track_register(track_id: str, user: dict = Depends(get_current_user)):
         async with httpx.AsyncClient(timeout=5.0) as client:
             res = await client.post(
                 f"{SUPABASE_URL}/rest/v1/track_receipts",
-                headers={**_sb_headers(), "Prefer": "resolution=ignore-duplicates,return=representation"},
+                headers={**_sb(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
                 json={"id": track_id, "opened_at": None, "created_at": datetime.utcnow().isoformat()},
             )
-            return {"ok": res.status_code in (200, 201), "status": res.status_code, "body": res.text}
+            logger.info(f"[register] track_id={track_id} status={res.status_code} body={res.text}")
+            return {"ok": res.status_code in (200, 201), "status": res.status_code}
     except Exception as e:
+        logger.error(f"[register] error: {e}")
         return {"ok": False, "error": str(e)}
 
 
-# ── Pixel: record open on first hit ──────────────────────────────────────────
 @app.get("/track/{track_id}.png")
 async def track_pixel(track_id: str, request: Request):
-    """
-    Serve pixel. Record the FIRST hit as open — no bot filtering.
-    Gmail only fetches images when the email is actually opened, so every
-    hit is a real open. We use UPSERT so it works even if /register was
-    never called (e.g. background.js failed silently).
-    """
     import re
-    import logging
-    ua = request.headers.get("user-agent", "")
-    logging.info(f"[pixel] track_id={track_id} ua={ua}")
+    ua  = request.headers.get("user-agent", "")
+    fwd = request.headers.get("x-forwarded-for", "")
+    logger.info(f"[pixel] HIT track_id={track_id} ua={ua!r} fwd={fwd}")
 
     if SUPABASE_URL and SUPABASE_KEY and re.match(r'^[0-9a-f]{24}$', track_id):
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                # UPSERT: insert row if missing, update opened_at only if currently null.
-                # We do this with two headers: merge-duplicates handles the conflict,
-                # but we need to protect opened_at from being overwritten on repeat opens.
-                # Solution: UPSERT the row in, then PATCH with a WHERE filter.
-                
-                # Step 1: ensure row exists (ignore if already there)
-                await client.post(
+
+                # 1. Ensure the row exists first (safe if already there)
+                ins = await client.post(
                     f"{SUPABASE_URL}/rest/v1/track_receipts",
-                    headers={**_sb_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+                    headers={**_sb(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
                     json={"id": track_id, "created_at": datetime.utcnow().isoformat()},
                 )
-                # Step 2: set opened_at only where it's still null — atomic, safe
-                patch_res = await client.patch(
+                logger.info(f"[pixel] insert status={ins.status_code}")
+
+                # 2. Set opened_at but ONLY if still null — preserves first-open timestamp
+                patch = await client.patch(
                     f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&opened_at=is.null",
-                    headers={**_sb_headers(), "Prefer": "return=minimal"},
+                    headers={**_sb(), "Prefer": "return=representation"},
                     json={"opened_at": datetime.utcnow().isoformat()},
                 )
-                logging.info(f"[pixel] patch status={patch_res.status_code}")
+                logger.info(f"[pixel] patch status={patch.status_code} body={patch.text!r}")
+
+                # If patch returned rows, it worked. If empty array, was already opened.
+                rows = patch.json() if patch.status_code == 200 else []
+                logger.info(f"[pixel] rows updated={len(rows)}")
+
         except Exception as e:
-            logging.error(f"[pixel] error: {e}")
+            logger.error(f"[pixel] EXCEPTION: {e}")
 
     return Response(content=_PIXEL, media_type="image/gif", headers=_NO_CACHE)
 
 
-# ── Status: polled by background.js every 30s ────────────────────────────────
+@app.get("/track/{track_id}/debug")
+async def track_debug(track_id: str, user: dict = Depends(get_current_user)):
+    """Hit this to see the raw Supabase row for any trackId."""
+    import re
+    if not re.match(r'^[0-9a-f]{24}$', track_id):
+        raise HTTPException(status_code=400, detail="Invalid track ID")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return {"error": "Supabase not configured"}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
+            headers=_sb(),
+        )
+    return {"status": res.status_code, "rows": res.json() if res.status_code == 200 else [], "raw": res.text}
+
+
 @app.get("/track/{track_id}/status")
 async def track_status(track_id: str, user: dict = Depends(get_current_user)):
     import re
@@ -228,7 +220,7 @@ async def track_status(track_id: str, user: dict = Depends(get_current_user)):
     async with httpx.AsyncClient(timeout=5.0) as client:
         res = await client.get(
             f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&select=opened_at",
-            headers=_sb_headers(),
+            headers=_sb(),
         )
     if res.status_code != 200 or not res.json():
         return {"opened": False, "openedAt": None}
