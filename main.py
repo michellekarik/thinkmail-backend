@@ -122,96 +122,148 @@ async def fix_email(request: Request, body: FixRequest, user: dict = Depends(get
 #   created_at  timestamptz
 
 _PIXEL = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'
+
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
-import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("thinkmail")
+# Known email proxy / scanner User-Agents that pre-fetch images
+# These are NOT real human opens — we ignore hits from these
+_BOT_UA_FRAGMENTS = [
+    "googleimageproxy",       # Gmail image proxy
+    "google image proxy",
+    "googleproxy",
+    "yahoo pipes",
+    "preview",
+    "mimecast",
+    "barracuda",
+    "proofpoint",
+    "outlook-link-preview",
+    "ms-office",
+    "wget",
+    "curl",
+    "python-requests",
+    "java/",
+    "go-http-client",
+    "apache-httpclient",
+]
 
-def _sb():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-    }
+def _is_bot(user_agent: str) -> bool:
+    ua = (user_agent or "").lower()
+
+    # ❌ REMOVE Gmail proxy from blocking
+    safe_allow = [
+        "googleimageproxy",  # Gmail
+        "google proxy",
+    ]
+
+    if any(x in ua for x in safe_allow):
+        return False
+
+    # Block only obvious scripts
+    bad = [
+        "python",
+        "curl",
+        "wget",
+        "httpclient",
+        "go-http-client",
+    ]
+
+    return any(x in ua for x in bad)
+
 
 
 @app.post("/track/{track_id}/register")
 async def track_register(track_id: str, user: dict = Depends(get_current_user)):
+    """
+    Called by background.js immediately after the email is sent.
+    Stores the send timestamp so we can ignore proxy hits in the grace period.
+    """
     import re
     if not re.match(r'^[0-9a-f]{24}$', track_id):
         raise HTTPException(status_code=400, detail="Invalid track ID")
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return {"ok": False, "reason": "Supabase not configured"}
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            res = await client.post(
-                f"{SUPABASE_URL}/rest/v1/track_receipts",
-                headers={**_sb(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
-                json={"id": track_id, "opened_at": None, "created_at": datetime.utcnow().isoformat()},
-            )
-            logger.info(f"[register] track_id={track_id} status={res.status_code} body={res.text}")
-            return {"ok": res.status_code in (200, 201), "status": res.status_code}
-    except Exception as e:
-        logger.error(f"[register] error: {e}")
-        return {"ok": False, "error": str(e)}
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{SUPABASE_URL}/rest/v1/track_receipts",
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "resolution=ignore-duplicates,return=minimal",
+                    },
+                    json={
+                        "id":         track_id,
+                        "sent_at":    datetime.utcnow().isoformat(),
+                        "created_at": datetime.utcnow().isoformat(),
+                        "opened_at":  None,
+                    },
+                )
+        except Exception:
+            pass
+    return {"ok": True}
 
 
 @app.get("/track/{track_id}.png")
 async def track_pixel(track_id: str, request: Request):
+    """
+    Serve the 1x1 pixel. Only record an open if:
+    1. User-Agent is NOT a known bot/proxy
+    2. The hit comes MORE than 45 seconds after the email was sent
+       (Gmail's proxy almost always fires within a few seconds of delivery)
+    """
     import re
-    ua  = request.headers.get("user-agent", "")
-    fwd = request.headers.get("x-forwarded-for", "")
-    logger.info(f"[pixel] HIT track_id={track_id} ua={ua!r} fwd={fwd}")
+    ua = request.headers.get("user-agent", "")
+    print("TRACK HIT:", track_id, ua)
 
     if SUPABASE_URL and SUPABASE_KEY and re.match(r'^[0-9a-f]{24}$', track_id):
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+        if not _is_bot(ua):
+            try:
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    # Get the row to check sent_at and whether already opened
+                    check = await client.get(
+                        f"{SUPABASE_URL}/rest/v1/track_receipts"
+                        f"?id=eq.{track_id}&select=sent_at,opened_at",
+                        headers={
+                            "apikey": SUPABASE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_KEY}",
+                        },
+                    )
+                    rows = check.json() if check.status_code == 200 else []
+                    row  = rows[0] if rows else {}
 
-                # 1. Ensure the row exists first (safe if already there)
-                ins = await client.post(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts",
-                    headers={**_sb(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
-                    json={"id": track_id, "created_at": datetime.utcnow().isoformat()},
-                )
-                logger.info(f"[pixel] insert status={ins.status_code}")
+                    already_opened = bool(row.get("opened_at"))
+                    sent_at_str    = row.get("sent_at")
 
-                # 2. Set opened_at but ONLY if still null — preserves first-open timestamp
-                patch = await client.patch(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&opened_at=is.null",
-                    headers={**_sb(), "Prefer": "return=representation"},
-                    json={"opened_at": datetime.utcnow().isoformat()},
-                )
-                logger.info(f"[pixel] patch status={patch.status_code} body={patch.text!r}")
+                    # Grace period: ignore hits within 45s of send
+                    in_grace = False
+                    if sent_at_str:
+                        try:
+                            sent_dt  = datetime.fromisoformat(sent_at_str.replace("Z", ""))
+                            age_secs = (datetime.utcnow() - sent_dt).total_seconds()
+                            in_grace = age_secs < 5
+                        except Exception:
+                            in_grace = False
 
-                # If patch returned rows, it worked. If empty array, was already opened.
-                rows = patch.json() if patch.status_code == 200 else []
-                logger.info(f"[pixel] rows updated={len(rows)}")
-
-        except Exception as e:
-            logger.error(f"[pixel] EXCEPTION: {e}")
+                    if not already_opened:
+                        await client.patch(
+                            f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
+                            headers={
+                                "apikey": SUPABASE_KEY,
+                                "Authorization": f"Bearer {SUPABASE_KEY}",
+                                "Content-Type": "application/json",
+                                "Prefer": "return=minimal",
+                            },
+                            json={"opened_at": datetime.utcnow().isoformat()},
+                        )
+            except Exception:
+                pass  # Never block pixel delivery
 
     return Response(content=_PIXEL, media_type="image/gif", headers=_NO_CACHE)
 
 
-@app.get("/track/{track_id}/debug")
-async def track_debug(track_id: str, user: dict = Depends(get_current_user)):
-    """Hit this to see the raw Supabase row for any trackId."""
-    import re
-    if not re.match(r'^[0-9a-f]{24}$', track_id):
-        raise HTTPException(status_code=400, detail="Invalid track ID")
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return {"error": "Supabase not configured"}
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        res = await client.get(
-            f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
-            headers=_sb(),
-        )
-    return {"status": res.status_code, "rows": res.json() if res.status_code == 200 else [], "raw": res.text}
-
-
 @app.get("/track/{track_id}/status")
 async def track_status(track_id: str, user: dict = Depends(get_current_user)):
+    """Returns whether the tracked email has been opened. Polled by background.js."""
     import re
     if not re.match(r'^[0-9a-f]{24}$', track_id):
         raise HTTPException(status_code=400, detail="Invalid track ID")
@@ -220,7 +272,7 @@ async def track_status(track_id: str, user: dict = Depends(get_current_user)):
     async with httpx.AsyncClient(timeout=5.0) as client:
         res = await client.get(
             f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&select=opened_at",
-            headers=_sb(),
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
         )
     if res.status_code != 200 or not res.json():
         return {"opened": False, "openedAt": None}
