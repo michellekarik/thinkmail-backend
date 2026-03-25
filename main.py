@@ -127,12 +127,9 @@ _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "
 
 @app.post("/track/{track_id}/register")
 async def track_register(track_id: str, user: dict = Depends(get_current_user)):
-    """
-    Called by background.js immediately after the email is sent.
-    Creates the Supabase row so the pixel endpoint has something to PATCH.
-    """
-    import re
-    if not re.match(r'^[0-9a-f]{24}$', track_id):
+    """Called by background.js after send. Creates the row in Supabase."""
+    import re as _re
+    if not _re.match(r'^[0-9a-f]{24}$', track_id):
         raise HTTPException(status_code=400, detail="Invalid track ID")
     if SUPABASE_URL and SUPABASE_KEY:
         try:
@@ -147,9 +144,8 @@ async def track_register(track_id: str, user: dict = Depends(get_current_user)):
                     },
                     json={
                         "id":         track_id,
-                        "sent_at":    datetime.utcnow().isoformat(),
-                        "created_at": datetime.utcnow().isoformat(),
                         "opened_at":  None,
+                        "created_at": datetime.utcnow().isoformat(),
                     },
                 )
         except Exception:
@@ -160,41 +156,28 @@ async def track_register(track_id: str, user: dict = Depends(get_current_user)):
 @app.get("/track/{track_id}.png")
 async def track_pixel(track_id: str, request: Request):
     """
-    Serve the 1x1 pixel and record the FIRST hit as an open.
+    Serve the 1x1 pixel.
 
-    Gmail ONLY fetches images on-demand when the recipient actually opens
-    the email — it does NOT pre-fetch on delivery. The googleimageproxy
-    IS the open event; it fires because the user opened the email, not on
-    arrival. Filtering it out was causing every open to be silently dropped.
-
-    We record the first hit and ignore duplicates via already_opened guard.
+    Uses a Supabase RPC to do a safe conditional upsert in one round-trip:
+      INSERT ... ON CONFLICT (id) DO UPDATE SET opened_at = now()
+      WHERE track_receipts.opened_at IS NULL
+    This means: create the row if missing (pixel arrived before /register),
+    set opened_at if not yet set, and leave it alone if already recorded.
+    Atomic, no race condition, preserves the FIRST open timestamp always.
     """
-    import re
-    if SUPABASE_URL and SUPABASE_KEY and re.match(r'^[0-9a-f]{24}$', track_id):
+    import re as _re
+    if SUPABASE_URL and SUPABASE_KEY and _re.match(r'^[0-9a-f]{24}$', track_id):
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
-                check = await client.get(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts"
-                    f"?id=eq.{track_id}&select=opened_at",
+                await client.post(
+                    f"{SUPABASE_URL}/rest/v1/rpc/record_open",
                     headers={
                         "apikey": SUPABASE_KEY,
                         "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "Content-Type": "application/json",
                     },
+                    json={"p_id": track_id},
                 )
-                rows = check.json() if check.status_code == 200 else []
-                row  = rows[0] if rows else {}
-
-                if not row.get("opened_at"):
-                    await client.patch(
-                        f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
-                        headers={
-                            "apikey": SUPABASE_KEY,
-                            "Authorization": f"Bearer {SUPABASE_KEY}",
-                            "Content-Type": "application/json",
-                            "Prefer": "return=minimal",
-                        },
-                        json={"opened_at": datetime.utcnow().isoformat()},
-                    )
         except Exception:
             pass  # Never block pixel delivery
 
