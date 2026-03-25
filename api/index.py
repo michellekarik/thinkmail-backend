@@ -7,12 +7,10 @@ from jose import jwt
 
 app = FastAPI()
 
-# ENV
 JWT_SECRET = os.getenv("JWT_SECRET", "secret")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +19,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AUTH
+# ✅ ROOT ROUTE (FIXES 404 CONFUSION)
+@app.get("/")
+async def root():
+    return {"status": "ThinkMail Backend Running 🚀"}
+
 def get_current_user(request: Request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -32,7 +34,6 @@ def get_current_user(request: Request):
     except:
         raise HTTPException(status_code=401)
 
-# PIXEL
 _PIXEL = (
     b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00'
     b'\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9'
@@ -45,13 +46,11 @@ _NO_CACHE = {
     "Pragma": "no-cache"
 }
 
-# BOT FILTER (allow Gmail)
 def _is_bot(ua: str):
     ua = (ua or "").lower()
     bad = ["python", "curl", "wget", "httpclient", "go-http-client"]
     return any(x in ua for x in bad)
 
-# REGISTER
 @app.post("/track/{track_id}/register")
 async def register(track_id: str, user=Depends(get_current_user)):
     if not re.match(r'^[0-9a-f]{24}$', track_id):
@@ -74,7 +73,6 @@ async def register(track_id: str, user=Depends(get_current_user)):
         )
     return {"ok": True}
 
-# PIXEL
 @app.get("/track/{track_id}.png")
 async def pixel(track_id: str, request: Request):
     ua = request.headers.get("user-agent", "")
@@ -94,7 +92,6 @@ async def pixel(track_id: str, request: Request):
 
     return Response(content=_PIXEL, media_type="image/gif", headers=_NO_CACHE)
 
-# STATUS
 @app.get("/track/{track_id}/status")
 async def status(track_id: str, user=Depends(get_current_user)):
     async with httpx.AsyncClient() as client:
