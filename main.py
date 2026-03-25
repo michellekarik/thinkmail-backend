@@ -122,71 +122,104 @@ async def fix_email(request: Request, body: FixRequest, user: dict = Depends(get
 #   created_at  timestamptz
 
 _PIXEL = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9\x04\x01\x00\x00\x00\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00\x3b'
-
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
-@app.post("/track/{track_id}/register")
-async def track_register(track_id: str, user: dict = Depends(get_current_user)):
-    """Called by background.js after send. Creates the row in Supabase."""
-    import re as _re
-    if not _re.match(r'^[0-9a-f]{24}$', track_id):
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+# ── DEBUG: inspect any tracking row ──────────────────────────────────────────
+@app.get("/track/{track_id}/debug")
+async def track_debug(track_id: str, user: dict = Depends(get_current_user)):
+    """Returns the raw Supabase row + recent pixel hits log. Use to diagnose issues."""
+    import re
+    if not re.match(r'^[0-9a-f]{24}$', track_id):
         raise HTTPException(status_code=400, detail="Invalid track ID")
+    result = {"track_id": track_id, "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY), "row": None, "error": None}
     if SUPABASE_URL and SUPABASE_KEY:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts",
-                    headers={
-                        "apikey": SUPABASE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_KEY}",
-                        "Content-Type": "application/json",
-                        "Prefer": "resolution=ignore-duplicates,return=minimal",
-                    },
-                    json={
-                        "id":         track_id,
-                        "opened_at":  None,
-                        "created_at": datetime.utcnow().isoformat(),
-                    },
+                res = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
+                    headers=_sb_headers(),
                 )
-        except Exception:
-            pass
-    return {"ok": True}
+                result["supabase_status"] = res.status_code
+                result["supabase_body"]   = res.text
+                rows = res.json() if res.status_code == 200 else []
+                result["row"] = rows[0] if rows else None
+                result["row_exists"] = bool(rows)
+        except Exception as e:
+            result["error"] = str(e)
+    return result
 
 
+# ── Register: create the row when email is sent ───────────────────────────────
+@app.post("/track/{track_id}/register")
+async def track_register(track_id: str, user: dict = Depends(get_current_user)):
+    import re
+    if not re.match(r'^[0-9a-f]{24}$', track_id):
+        raise HTTPException(status_code=400, detail="Invalid track ID")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return {"ok": False, "reason": "Supabase not configured"}
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            res = await client.post(
+                f"{SUPABASE_URL}/rest/v1/track_receipts",
+                headers={**_sb_headers(), "Prefer": "resolution=ignore-duplicates,return=representation"},
+                json={"id": track_id, "opened_at": None, "created_at": datetime.utcnow().isoformat()},
+            )
+            return {"ok": res.status_code in (200, 201), "status": res.status_code, "body": res.text}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ── Pixel: record open on first hit ──────────────────────────────────────────
 @app.get("/track/{track_id}.png")
 async def track_pixel(track_id: str, request: Request):
     """
-    Serve the 1x1 pixel.
-
-    Uses a Supabase RPC to do a safe conditional upsert in one round-trip:
-      INSERT ... ON CONFLICT (id) DO UPDATE SET opened_at = now()
-      WHERE track_receipts.opened_at IS NULL
-    This means: create the row if missing (pixel arrived before /register),
-    set opened_at if not yet set, and leave it alone if already recorded.
-    Atomic, no race condition, preserves the FIRST open timestamp always.
+    Serve pixel. Record the FIRST hit as open — no bot filtering.
+    Gmail only fetches images when the email is actually opened, so every
+    hit is a real open. We use UPSERT so it works even if /register was
+    never called (e.g. background.js failed silently).
     """
-    import re as _re
-    if SUPABASE_URL and SUPABASE_KEY and _re.match(r'^[0-9a-f]{24}$', track_id):
+    import re
+    import logging
+    ua = request.headers.get("user-agent", "")
+    logging.info(f"[pixel] track_id={track_id} ua={ua}")
+
+    if SUPABASE_URL and SUPABASE_KEY and re.match(r'^[0-9a-f]{24}$', track_id):
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # UPSERT: insert row if missing, update opened_at only if currently null.
+                # We do this with two headers: merge-duplicates handles the conflict,
+                # but we need to protect opened_at from being overwritten on repeat opens.
+                # Solution: UPSERT the row in, then PATCH with a WHERE filter.
+                
+                # Step 1: ensure row exists (ignore if already there)
                 await client.post(
-                    f"{SUPABASE_URL}/rest/v1/rpc/record_open",
-                    headers={
-                        "apikey": SUPABASE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"p_id": track_id},
+                    f"{SUPABASE_URL}/rest/v1/track_receipts",
+                    headers={**_sb_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+                    json={"id": track_id, "created_at": datetime.utcnow().isoformat()},
                 )
-        except Exception:
-            pass  # Never block pixel delivery
+                # Step 2: set opened_at only where it's still null — atomic, safe
+                patch_res = await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&opened_at=is.null",
+                    headers={**_sb_headers(), "Prefer": "return=minimal"},
+                    json={"opened_at": datetime.utcnow().isoformat()},
+                )
+                logging.info(f"[pixel] patch status={patch_res.status_code}")
+        except Exception as e:
+            logging.error(f"[pixel] error: {e}")
 
     return Response(content=_PIXEL, media_type="image/gif", headers=_NO_CACHE)
 
 
+# ── Status: polled by background.js every 30s ────────────────────────────────
 @app.get("/track/{track_id}/status")
 async def track_status(track_id: str, user: dict = Depends(get_current_user)):
-    """Returns whether the tracked email has been opened. Polled by background.js."""
     import re
     if not re.match(r'^[0-9a-f]{24}$', track_id):
         raise HTTPException(status_code=400, detail="Invalid track ID")
@@ -195,7 +228,7 @@ async def track_status(track_id: str, user: dict = Depends(get_current_user)):
     async with httpx.AsyncClient(timeout=5.0) as client:
         res = await client.get(
             f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}&select=opened_at",
-            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            headers=_sb_headers(),
         )
     if res.status_code != 200 or not res.json():
         return {"opened": False, "openedAt": None}
