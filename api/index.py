@@ -87,8 +87,9 @@ async def track_pixel(track_id: str, request: Request):
 
 
 # ✅ FIX 3: STATUS (unchanged but clean)
-@app.get("/track/{track_id}/status")
-async def track_status(track_id: str, user: dict = Depends(get_current_user)):
+@app.post("/track/{track_id}/register")
+async def track_register(track_id: str):
+
     if not re.match(r'^[0-9a-f]{24}$', track_id):
         raise HTTPException(status_code=400, detail="Invalid track ID")
 
