@@ -125,37 +125,11 @@ _PIXEL = b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\
 
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
-# Known email proxy / scanner User-Agents that pre-fetch images
-# These are NOT real human opens — we ignore hits from these
-_BOT_UA_FRAGMENTS = [
-    "googleimageproxy",       # Gmail image proxy
-    "google image proxy",
-    "googleproxy",
-    "yahoo pipes",
-    "preview",
-    "mimecast",
-    "barracuda",
-    "proofpoint",
-    "outlook-link-preview",
-    "ms-office",
-    "wget",
-    "curl",
-    "python-requests",
-    "java/",
-    "go-http-client",
-    "apache-httpclient",
-]
-
-def _is_bot(user_agent: str) -> bool:
-    ua = (user_agent or "").lower()
-    return any(frag in ua for frag in _BOT_UA_FRAGMENTS)
-
-
 @app.post("/track/{track_id}/register")
 async def track_register(track_id: str, user: dict = Depends(get_current_user)):
     """
     Called by background.js immediately after the email is sent.
-    Stores the send timestamp so we can ignore proxy hits in the grace period.
+    Creates the Supabase row so the pixel endpoint has something to PATCH.
     """
     import re
     if not re.match(r'^[0-9a-f]{24}$', track_id):
@@ -186,56 +160,43 @@ async def track_register(track_id: str, user: dict = Depends(get_current_user)):
 @app.get("/track/{track_id}.png")
 async def track_pixel(track_id: str, request: Request):
     """
-    Serve the 1x1 pixel. Only record an open if:
-    1. User-Agent is NOT a known bot/proxy
-    2. The hit comes MORE than 45 seconds after the email was sent
-       (Gmail's proxy almost always fires within a few seconds of delivery)
+    Serve the 1x1 pixel and record the FIRST hit as an open.
+
+    Gmail ONLY fetches images on-demand when the recipient actually opens
+    the email — it does NOT pre-fetch on delivery. The googleimageproxy
+    IS the open event; it fires because the user opened the email, not on
+    arrival. Filtering it out was causing every open to be silently dropped.
+
+    We record the first hit and ignore duplicates via already_opened guard.
     """
     import re
-    ua = request.headers.get("user-agent", "")
-
     if SUPABASE_URL and SUPABASE_KEY and re.match(r'^[0-9a-f]{24}$', track_id):
-        if not _is_bot(ua):
-            try:
-                async with httpx.AsyncClient(timeout=3.0) as client:
-                    # Get the row to check sent_at and whether already opened
-                    check = await client.get(
-                        f"{SUPABASE_URL}/rest/v1/track_receipts"
-                        f"?id=eq.{track_id}&select=sent_at,opened_at",
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                check = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/track_receipts"
+                    f"?id=eq.{track_id}&select=opened_at",
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                    },
+                )
+                rows = check.json() if check.status_code == 200 else []
+                row  = rows[0] if rows else {}
+
+                if not row.get("opened_at"):
+                    await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
                         headers={
                             "apikey": SUPABASE_KEY,
                             "Authorization": f"Bearer {SUPABASE_KEY}",
+                            "Content-Type": "application/json",
+                            "Prefer": "return=minimal",
                         },
+                        json={"opened_at": datetime.utcnow().isoformat()},
                     )
-                    rows = check.json() if check.status_code == 200 else []
-                    row  = rows[0] if rows else {}
-
-                    already_opened = bool(row.get("opened_at"))
-                    sent_at_str    = row.get("sent_at")
-
-                    # Grace period: ignore hits within 45s of send
-                    in_grace = False
-                    if sent_at_str:
-                        try:
-                            sent_dt  = datetime.fromisoformat(sent_at_str.replace("Z", ""))
-                            age_secs = (datetime.utcnow() - sent_dt).total_seconds()
-                            in_grace = age_secs < 45
-                        except Exception:
-                            in_grace = False
-
-                    if not already_opened and not in_grace:
-                        await client.patch(
-                            f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
-                            headers={
-                                "apikey": SUPABASE_KEY,
-                                "Authorization": f"Bearer {SUPABASE_KEY}",
-                                "Content-Type": "application/json",
-                                "Prefer": "return=minimal",
-                            },
-                            json={"opened_at": datetime.utcnow().isoformat()},
-                        )
-            except Exception:
-                pass  # Never block pixel delivery
+        except Exception:
+            pass  # Never block pixel delivery
 
     return Response(content=_PIXEL, media_type="image/gif", headers=_NO_CACHE)
 
