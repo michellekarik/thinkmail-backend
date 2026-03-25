@@ -290,7 +290,6 @@ async def get_me(user: dict = Depends(get_current_user)):
 # Supabase table required:
 #   CREATE TABLE track_receipts (
 #     id         text PRIMARY KEY,
-#     sent_at    timestamptz,
 #     opened_at  timestamptz,
 #     created_at timestamptz DEFAULT now()
 #   );
@@ -318,70 +317,36 @@ def _is_bot(ua: str) -> bool:
     return any(frag in ua for frag in _BOT_UA)
 
 
-@app.post("/track/{track_id}/register")
-async def track_register(track_id: str, user: dict = Depends(get_current_user)):
-    """
-    Called by background.js immediately after email is sent.
-    Records send time so the pixel endpoint can enforce the 45s grace period
-    (ignoring Gmail's proxy which fires within seconds of delivery).
-    """
-    if not re.match(r'^[0-9a-f]{24}$', track_id):
-        raise HTTPException(status_code=400, detail="Invalid track ID")
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    f"{SUPABASE_URL}/rest/v1/track_receipts",
-                    headers=supa_headers({"Prefer": "resolution=ignore-duplicates,return=minimal"}),
-                    json={
-                        "id": track_id,
-                        "sent_at":    datetime.utcnow().isoformat(),
-                        "created_at": datetime.utcnow().isoformat(),
-                        "opened_at":  None,
-                    },
-                )
-        except Exception:
-            pass
-    return {"ok": True}
-
 
 @app.get("/track/{track_id}.png")
 async def track_pixel(track_id: str, request: Request):
     """
-    Serve 1x1 pixel. Only record a real open if:
-    1. User-Agent is NOT a known bot/proxy
-    2. Hit arrives MORE than 45s after the email was sent
+    Serve 1x1 pixel and record a real open.
+    Only ignored if the User-Agent is Gmail's image proxy or a known scanner —
+    these fire automatically on delivery before any human opens the email.
+    A real human open comes from a mail client UA (Outlook, Apple Mail, Gmail app, browser etc).
+    No timers. No guessing. UA is the only signal.
     """
     ua = request.headers.get("user-agent", "")
 
     if SUPABASE_URL and SUPABASE_KEY and re.match(r'^[0-9a-f]{24}$', track_id) and not _is_bot(ua):
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
+                # Only record the FIRST open — preserve the original timestamp
                 check = await client.get(
                     f"{SUPABASE_URL}/rest/v1/track_receipts"
-                    f"?id=eq.{track_id}&select=sent_at,opened_at",
+                    f"?id=eq.{track_id}&select=opened_at",
                     headers=supa_headers(),
                 )
                 rows = check.json() if check.status_code == 200 else []
                 row  = rows[0] if rows else {}
 
                 if not row.get("opened_at"):
-                    # Enforce grace period
-                    in_grace = False
-                    sent_str = row.get("sent_at")
-                    if sent_str:
-                        try:
-                            sent_dt  = datetime.fromisoformat(sent_str.replace("Z", ""))
-                            in_grace = (datetime.utcnow() - sent_dt).total_seconds() < 45
-                        except Exception:
-                            pass
-
-                    if not in_grace:
-                        await client.patch(
-                            f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
-                            headers=supa_headers({"Prefer": "return=minimal"}),
-                            json={"opened_at": datetime.utcnow().isoformat()},
-                        )
+                    await client.patch(
+                        f"{SUPABASE_URL}/rest/v1/track_receipts?id=eq.{track_id}",
+                        headers=supa_headers({"Prefer": "return=minimal"}),
+                        json={"opened_at": datetime.utcnow().isoformat()},
+                    )
         except Exception:
             pass
 
