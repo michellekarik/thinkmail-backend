@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse
 import os, re, httpx
 from datetime import datetime
 from jose import jwt
@@ -12,6 +12,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "secret")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -21,12 +24,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ROOT (for testing)
+# ROOT
 @app.get("/")
 async def root():
     return {"status": "ThinkMail backend running"}
 
-# AUTH
+# ================= AUTH =================
+
+@app.get("/auth/google")
+async def auth_google():
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        "&response_type=code"
+        "&scope=openid email profile"
+        "&access_type=offline"
+        "&prompt=consent"
+    )
+    return RedirectResponse(url)
+
+
+# ================= AUTH HELPER =================
+
 def get_current_user(request: Request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -37,7 +57,9 @@ def get_current_user(request: Request):
     except:
         raise HTTPException(status_code=401)
 
-# PIXEL (1x1)
+
+# ================= TRACKING =================
+
 _PIXEL = (
     b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00'
     b'\x80\x00\x00\xff\xff\xff\x00\x00\x00\x21\xf9'
@@ -50,11 +72,11 @@ _NO_CACHE = {
     "Pragma": "no-cache"
 }
 
-# BOT FILTER (allow Gmail proxy)
 def _is_bot(ua: str):
     ua = (ua or "").lower()
     bad = ["python", "curl", "wget", "httpclient", "go-http-client"]
     return any(x in ua for x in bad)
+
 
 # REGISTER TRACK
 @app.post("/track/{track_id}/register")
@@ -80,11 +102,11 @@ async def register(track_id: str, user=Depends(get_current_user)):
 
     return {"ok": True}
 
-# TRACK PIXEL (email open)
+
+# PIXEL HIT
 @app.get("/track/{track_id}.png")
 async def pixel(track_id: str, request: Request):
     ua = request.headers.get("user-agent", "")
-    print("OPEN:", track_id, ua)
 
     if SUPABASE_URL and SUPABASE_KEY and not _is_bot(ua):
         async with httpx.AsyncClient() as client:
@@ -100,7 +122,8 @@ async def pixel(track_id: str, request: Request):
 
     return Response(content=_PIXEL, media_type="image/gif", headers=_NO_CACHE)
 
-# STATUS CHECK (extension polls this)
+
+# STATUS CHECK
 @app.get("/track/{track_id}/status")
 async def status(track_id: str, user=Depends(get_current_user)):
     async with httpx.AsyncClient() as client:
