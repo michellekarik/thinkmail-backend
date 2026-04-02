@@ -129,8 +129,6 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "
 
 
 # ── Fallback reply generator ──────────────────────────────────────────────────
-# If the model skips SUGGESTED REPLY, call it again just for the reply.
-# This guarantees a reply is ALWAYS returned — no exceptions.
 
 async def get_fallback_reply(thread: str, draft: str, today: str) -> str:
     """Generate a reply when the main prompt fails"""
@@ -163,7 +161,6 @@ Return ONLY the reply text, nothing else."""
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
     has_draft = draft.strip()
     
-    # Enhanced instruction to ensure risk analysis is never blank
     analysis_instruction = """
 YOU MUST PROVIDE ALL SECTIONS BELOW. DO NOT SKIP ANY. If you cannot determine something, write "Unknown" or "Neutral" - but NEVER leave blank.
 
@@ -331,28 +328,211 @@ async def auth_callback(code: str, request: Request):
 
 @app.get("/auth/extension-callback")
 async def extension_callback(token: str, name: str = "", email: str = ""):
-    html = (
-        "<!DOCTYPE html><html><head><title>ThinkMail</title>"
-        "<style>*{box-sizing:border-box;margin:0;padding:0}"
-        "body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;"
-        "height:100vh;background:#0d0f10;color:#edf0f2;flex-direction:column;gap:14px;"
-        "text-align:center;padding:24px}"
-        ".icon{width:52px;height:52px;border-radius:14px;"
-        "background:linear-gradient(135deg,#4285F4,#34A853);display:flex;"
-        "align-items:center;justify-content:center;font-size:22px;margin-bottom:4px}"
-        "h2{font-size:20px;font-weight:600}p{color:#8d9499;font-size:13px;line-height:1.6}"
-        ".em{color:#4285F4;font-size:13px}</style></head><body>"
-        "<div class='icon'>✦</div><h2>Signed in!</h2>"
-        "<div class='em'>" + email + "</div>"
-        "<p>You can close this tab and go back to Gmail.</p>"
-        "<script>"
-        "try{localStorage.setItem('mailmind_token','" + token + "');"
-        "localStorage.setItem('mailmind_name','" + name + "');"
-        "localStorage.setItem('mailmind_email','" + email + "');}catch(e){}"
-        "setTimeout(()=>{window.location.href='https://mail.google.com';},2000);"
-        "</script></body></html>"
-    )
-    return HTMLResponse(html)
+    # HTML page that will auto-redirect to Gmail
+    html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ThinkMail - Sign In Successful</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: linear-gradient(135deg, #0a0e12 0%, #0d1117 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #e6edf3;
+        }}
+        .container {{
+            text-align: center;
+            padding: 2rem;
+        }}
+        .success-icon {{
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #238636, #2ea043);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 1.5rem;
+            animation: scaleIn 0.5s ease-out;
+        }}
+        .success-icon svg {{
+            width: 48px;
+            height: 48px;
+            stroke: white;
+            stroke-width: 2;
+        }}
+        h1 {{
+            font-size: 1.75rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #fff, #7d8590);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }}
+        .email {{
+            color: #58a6ff;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+            word-break: break-all;
+        }}
+        .message {{
+            color: #8b949e;
+            margin-bottom: 2rem;
+            font-size: 0.95rem;
+        }}
+        .loader {{
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 3px solid #30363d;
+            border-top-color: #58a6ff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-top: 1rem;
+        }}
+        .redirect-text {{
+            margin-top: 1rem;
+            font-size: 0.85rem;
+            color: #8b949e;
+        }}
+        .manual-link {{
+            margin-top: 1.5rem;
+            font-size: 0.8rem;
+        }}
+        .manual-link a {{
+            color: #58a6ff;
+            text-decoration: none;
+        }}
+        .manual-link a:hover {{
+            text-decoration: underline;
+        }}
+        @keyframes spin {{
+            to {{ transform: rotate(360deg); }}
+        }}
+        @keyframes scaleIn {{
+            from {{
+                transform: scale(0);
+                opacity: 0;
+            }}
+            to {{
+                transform: scale(1);
+                opacity: 1;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+        </div>
+        <h1>Successfully Signed In!</h1>
+        <div class="email">{email}</div>
+        <div class="message">Welcome back to ThinkMail</div>
+        <div class="loader"></div>
+        <div class="redirect-text">Redirecting you to Gmail...</div>
+        <div class="manual-link">
+            <a href="https://mail.google.com" target="_blank">Click here if redirect doesn't work</a>
+        </div>
+    </div>
+
+    <script>
+        // Store token in chrome.storage.local
+        const token = "{token}";
+        const userName = decodeURIComponent("{name}");
+        const userEmail = decodeURIComponent("{email}");
+        
+        console.log('[ThinkMail] Saving auth data...');
+        
+        // Function to redirect to Gmail
+        function redirectToGmail() {{
+            console.log('[ThinkMail] Redirecting to Gmail...');
+            
+            // Try to close this tab and focus Gmail
+            if (typeof chrome !== 'undefined' && chrome.tabs) {{
+                // Find existing Gmail tab
+                chrome.tabs.query({{ url: '*://mail.google.com/*' }}, function(tabs) {{
+                    if (tabs && tabs.length > 0) {{
+                        // Focus existing Gmail tab
+                        chrome.tabs.update(tabs[0].id, {{ active: true }}, function() {{
+                            console.log('[ThinkMail] Focused existing Gmail tab');
+                            // Close current tab
+                            chrome.tabs.getCurrent(function(currentTab) {{
+                                if (currentTab && currentTab.id) {{
+                                    chrome.tabs.remove(currentTab.id);
+                                }}
+                            }});
+                        }});
+                    }} else {{
+                        // Open new Gmail tab
+                        chrome.tabs.create({{ url: 'https://mail.google.com' }}, function() {{
+                            console.log('[ThinkMail] Opened new Gmail tab');
+                            // Close current tab
+                            chrome.tabs.getCurrent(function(currentTab) {{
+                                if (currentTab && currentTab.id) {{
+                                    chrome.tabs.remove(currentTab.id);
+                                }}
+                            }});
+                        }});
+                    }}
+                }});
+            }} else {{
+                // Fallback for non-extension context
+                window.location.href = 'https://mail.google.com';
+            }}
+        }}
+        
+        // Save token to chrome.storage
+        if (typeof chrome !== 'undefined' && chrome.storage) {{
+            chrome.storage.local.set({{
+                authToken: token,
+                userName: userName,
+                userEmail: userEmail
+            }}, function() {{
+                console.log('[ThinkMail] Token saved to chrome.storage');
+                
+                // Notify extension that auth is complete
+                chrome.runtime.sendMessage({{
+                    action: 'authComplete',
+                    name: userName,
+                    email: userEmail
+                }}).catch(err => console.log('[ThinkMail] No listeners for authComplete'));
+                
+                // Redirect after 2 seconds
+                setTimeout(redirectToGmail, 2000);
+            }});
+        }} else {{
+            // Fallback: redirect immediately
+            console.log('[ThinkMail] Chrome storage not available, redirecting immediately');
+            setTimeout(function() {{
+                window.location.href = 'https://mail.google.com';
+            }}, 2000);
+        }}
+        
+        // Also save to localStorage as backup
+        try {{
+            localStorage.setItem('thinkmail_token', token);
+            localStorage.setItem('thinkmail_name', userName);
+            localStorage.setItem('thinkmail_email', userEmail);
+        }} catch(e) {{}}
+    </script>
+</body>
+</html>
+"""
+    return HTMLResponse(html_content)
 
 
 @app.post("/fix", response_model=FixResponse)
