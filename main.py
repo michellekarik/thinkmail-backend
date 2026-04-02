@@ -8,6 +8,7 @@ ThinkMail Backend
 
 import os
 import json
+import re
 import hashlib
 import httpx
 from datetime import datetime, timedelta
@@ -102,7 +103,7 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "
     if not GROQ_API_KEY:
         raise HTTPException(status_code=500, detail="Groq API key not configured.")
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -132,18 +133,27 @@ async def call_groq(messages: list[dict], max_tokens: int = 1024, model: str = "
 # This guarantees a reply is ALWAYS returned — no exceptions.
 
 async def get_fallback_reply(thread: str, draft: str, today: str) -> str:
+    """Generate a reply when the main prompt fails"""
     has_draft = draft.strip()
-    prompt = (
-        "You are ThinkMail. Today: " + today + "\n\n"
-        "EMAIL THREAD:\n" + (thread.strip() or "No thread available.") + "\n\n"
-        + ("USER DRAFT:\n" + draft.strip() + "\n\n" if has_draft else "")
-        + "IMPORTANT: The user is the person who needs to REPLY — NOT the person who sent the last message. "
-        + "The last message was sent TO the user. Write the reply FROM the user, TO the other person. "
-        + "Open with the OTHER person's name. Sign off with the USER's name. "
-        + "Match the format, opener, sign-off, length and tone of the thread history exactly. "
-        + ("Improve and complete the user's draft. " if has_draft else "Write from scratch. ")
-        + "Sound like a confident real human. Return ONLY the reply text, nothing else."
-    )
+    
+    prompt = f"""Today: {today}
+
+THREAD (read carefully to understand the relationship and history):
+{thread.strip() if thread.strip() else "No thread"}
+
+{"USER'S DRAFT: " + draft.strip() if has_draft else "No draft written"}
+
+Write a reply FROM the user TO the person who sent the last message.
+
+REQUIREMENTS:
+1. If there's a thread, match the exact opener and sign-off pattern from the history
+2. {f"Keep the user's intent from their draft but fix the delivery" if has_draft else "Write a complete reply from scratch"}
+3. Sound like a real person having a conversation
+4. Reference specific details from the thread
+5. Do NOT use generic AI phrases like "I hope this message finds you well"
+
+Return ONLY the reply text, nothing else."""
+    
     messages = [{"role": "user", "content": prompt}]
     return await call_groq(messages, max_tokens=512, model="llama-3.3-70b-versatile")
 
@@ -152,120 +162,71 @@ async def get_fallback_reply(thread: str, draft: str, today: str) -> str:
 
 def build_prompt(thread: str, draft: str, today: str) -> list[dict]:
     has_draft = draft.strip()
-    draft_section = (
-        "USER HAS ALREADY TYPED THIS DRAFT:\n---\n" + draft + "\n---\n\n"
-        "The user has started writing. Understand what they are trying to say and give them "
-        "the best version of it for this specific situation and relationship."
-        if has_draft else
-        "USER HAS NO DRAFT — write the reply entirely from scratch based on the full thread context."
-    )
-    thread_section = thread.strip() if thread.strip() else "No thread — only a draft is available."
+    
+    # Enhanced instruction to ensure risk analysis is never blank
+    analysis_instruction = """
+YOU MUST PROVIDE ALL SECTIONS BELOW. DO NOT SKIP ANY. If you cannot determine something, write "Unknown" or "Neutral" - but NEVER leave blank.
 
+TONE: [Pick one: Formal / Casual / Tense / Friendly / Aggressive / Professional / Urgent / Appreciative]
+
+URGENCY: [Pick one: Low / Medium / High - Based on deadlines, time-sensitive language, or pressure in the thread]
+
+VIBE: [Pick one: Positive / Neutral / Tense / Hostile / Warm / Cold / Anxious / Confident]
+
+INTENT: [One short phrase explaining what the other person ACTUALLY wants - e.g., "Get a refund", "Schedule meeting", "Avoid responsibility", "Seek approval"]
+
+RISK: [Pick one: Low / Medium / High - Consider: Could this escalate? Legal implications? Relationship damage? Career impact?]
+
+SITUATION:
+[2-3 sentences: Who are these people? What's the history? What just happened? What does each side want?]
+
+CONTEXT ANALYSIS:
+[2-3 sentences: Power dynamics, unspoken tensions, what the user should know before replying]
+
+CONFLICTS:
+[If user's draft is wrong: "The draft is too aggressive for this relationship" or "Missing key acknowledgment from thread"
+If nothing wrong: "No conflicts detected - the draft aligns with the conversation"]
+"""
+    
     if not thread.strip() and not draft.strip():
         user_content = "Tell the user to open a Gmail thread first."
     else:
-        user_content = (
-            "Today: " + today + "\n\n"
-            + thread_section + "\n\n"
-            + draft_section + "\n\n"
-            + """Read every email in the thread carefully before responding.
+        user_content = f"""Today: {today}
 
-STEP 1 — EXTRACT THE EMAIL FORMAT:
-Study every email in the thread and note exactly:
-- Opener style: Hey [name], Hi, Dear, straight to point, or nothing?
-- Sign-off: Thanks [name], Regards, Cheers, name only, phone number, or nothing?
-- Length: short punchy lines or full paragraphs?
-- Formality: close friend, colleague, boss, client, stranger?
-- Any recurring patterns: bullet points, line breaks, specific phrases they always use?
+{thread.strip() if thread.strip() else "No thread available - user is starting fresh."}
 
-FORMAT RULE — non-negotiable:
-If there IS a back-and-forth history between these two people in the thread:
-  → The SUGGESTED REPLY must mirror that exact format. Same opener, same sign-off, same length, same tone.
-  → Example: if every email ends "Thanks, Priya" — end with that. If they write short 2-line replies — do that.
-  → Never invent a format that does not already exist in their history.
+USER DRAFT:
+{draft.strip() if has_draft else "No draft written yet"}
 
-If this is the FIRST email or there is NO prior reply history (only one email in the thread):
-  → Use a clean professional default: opener with the person's name, clear body, sign off with the user's name.
-  → Match the formality level of the incoming email — if they wrote formally, reply formally. If casual, casual.
-  → Example default format:
-     Hi [Name],
-     [Body of reply]
-     Thanks,
-     [User's name]
-
-STEP 2 — IDENTIFY WHO IS WHO:
-The person who sent the LAST message in the thread is the OTHER person — not the user.
-The user is whoever needs to REPLY. Look at earlier emails to find the user's name and sign-off style.
-The SUGGESTED REPLY opens with the OTHER person's name and signs off with the USER's name.
-
-STEP 3 — DETECT LANGUAGE:
-If the user typed a draft — check what language it is in.
-If the draft is in Hindi, Japanese, Spanish, Tamil, French, or any non-English language — write the SUGGESTED REPLY in that exact language.
-If the draft is in English or there is no draft — write the SUGGESTED REPLY in English.
-TONE, URGENCY, VIBE, INTENT, RISK, SITUATION, CONTEXT ANALYSIS, CONFLICTS are always in English.
-
-STEP 4 — RESPOND IN THIS EXACT FORMAT. ALL SECTIONS ARE MANDATORY. DO NOT SKIP ANY:
-
-TONE: [one word: Formal / Casual / Tense / Friendly / Aggressive / Professional]
-URGENCY: [one word: Low / Medium / High]
-VIBE: [one word: Positive / Neutral / Tense / Hostile / Warm]
-INTENT: [one short phrase — what does the other person actually want?]
-RISK: [one word: Low / Medium / High]
-
-SITUATION:
-[3-4 plain English sentences. What is happening? Who are these people, what is the history, what is the current moment?]
-
-CONTEXT ANALYSIS:
-[Power dynamic, tone shifts, promises made or broken, what the user must understand before replying.]
-
-CONFLICTS:
-[Did the user's draft miss or contradict something from the thread? Is their tone wrong for this relationship? If nothing is wrong: No conflicts detected.]
+{analysis_instruction}
 
 SUGGESTED REPLY:
-[MANDATORY — you must always write this. Never skip it under any circumstances.
-If they typed a draft: keep their intent, fix the delivery for this situation.
-If no draft: write from scratch based on the full thread.
-FORMAT RULE — non-negotiable: match the exact opener, sign-off, length and formality from the thread history. If emails end with "Thanks, Priya" use that. If casual with no sign-off, do that. Never invent a format that does not exist in the history.
-Sound like a confident real human. No filler. No pushover replies.]"""
-        )
+[MANDATORY - Write the actual email reply here. If user has a draft, improve it while keeping their intent. If no draft, write from scratch based on the thread.
 
-    # Figure out who the user is from the last email they sent in the thread
-    # The user is the person who RECEIVES the most recent message and needs to reply
-    user_identity_instruction = (
-        "CRITICAL — WHO IS THE USER:\n"
-        "The USER is the person reading this right now who needs to send a reply. "
-        "They are NOT the person who sent the last message. "
-        "The last message in the thread was sent TO the user — the user needs to reply TO that person. "
-        "Read the thread carefully to identify who the user is (they will appear as a sender in earlier emails). "
-        "The SUGGESTED REPLY must be written FROM the user, TO the other person. "
-        "Open with the OTHER person's name. Sign off with the USER's name. Never mix these up.\n\n"
+IMPORTANT FORMAT RULES:
+1. If there are existing emails in the thread, match the EXACT same opener and sign-off pattern
+2. Example: If emails end with "Thanks, Sarah" - use that. If they start with "Hey John" - use that.
+3. If no thread history, use standard: "Hi [Name],\\n\\n[Body]\\n\\nBest,\\n[User's name]"
 
-        "LANGUAGE RULE:\n"
-        "If the user has typed a draft, detect what language it is written in.\n"
-        "- If the draft is in a non-English language (Hindi, Japanese, Spanish, French, Tamil, etc.) "
-        "— write the SUGGESTED REPLY in that same language.\n"
-        "- If the draft is in English or there is no draft — write the SUGGESTED REPLY in English.\n"
-        "- All other sections (TONE, URGENCY, VIBE, INTENT, RISK, SITUATION, CONTEXT ANALYSIS, CONFLICTS) "
-        "must always be in English regardless of the reply language.\n\n"
-    )
+Write naturally like a real person. No AI filler language like "I hope this email finds you well" unless that's in the thread history.
+Sound confident and authentic to the user's relationship with this person.]
 
-    system_content = (
-        "You are ThinkMail — email situational intelligence.\n"
-        "Today: " + today + "\n\n"
-        + user_identity_instruction +
-        "Rules you never break:\n"
-        "1. Read the FULL thread — every email, not just the last one.\n"
-        "2. You are on the USER's side. Always. Write the reply AS the user, TO the other person.\n"
-        "3. If the user typed a draft, understand what they meant and say it right for this situation.\n"
-        "4. SUGGESTED REPLY is ALWAYS required. You must write it every single time without exception.\n"
-        "5. FORMAT RULE: If there is back-and-forth history — mirror it exactly: same opener, "
-        "same sign-off, same length, same formality. If it is the first email or no prior replies exist — "
-        "use a clean professional default matching the formality of the incoming email: "
-        "opener with their name, clear body, sign off with user's name.\n"
-        "6. Sound like a real human. No generic AI text.\n"
-        "Always follow the exact output format. All six sections are mandatory."
-    )
+SUGGESTED REPLY:"""
+    
+    system_content = f"""You are ThinkMail - an email intelligence assistant. Today: {today}
 
+CRITICAL RULES:
+1. You are writing AS the user, TO the other person. Never mix up who is who.
+2. The LAST message in the thread was sent TO the user. The user needs to reply TO that person.
+3. Read EVERY email in the thread to understand the relationship, patterns, and history.
+4. You MUST output all sections (TONE, URGENCY, VIBE, INTENT, RISK, SITUATION, CONTEXT ANALYSIS, CONFLICTS, SUGGESTED REPLY)
+5. NEVER skip or leave blank the RISK field - analyze based on: potential escalation, relationship damage, missed opportunities, legal exposure
+6. If the user wrote a draft in another language (Hindi, Spanish, etc.), reply in that same language
+7. Be specific - not generic. Reference specific details from the thread
+8. Sound like a real human, not ChatGPT
+
+You are the user's strategic advisor. Help them respond effectively for THEIR best outcome."""
+    
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": user_content}
@@ -407,18 +368,42 @@ async def fix_email(
     except Exception as e:
         raise HTTPException(status_code=429, detail=str(e))
 
-    today    = datetime.now().strftime("%A, %B %d %Y")
+    today = datetime.now().strftime("%A, %B %d %Y")
+    
+    # Log for debugging
+    print(f"[ThinkMail] Processing fix for user {user_id}")
+    print(f"[ThinkMail] Thread length: {len(body.thread or '')}")
+    print(f"[ThinkMail] Draft length: {len(body.draft or '')}")
+    
     messages = build_prompt(body.thread or "", body.draft or "", today)
-    result   = await call_groq(messages, max_tokens=1200, model="llama-3.3-70b-versatile")
-
-    # ── Guarantee a reply is always present ──────────────────────────────────
-    # If the model skipped SUGGESTED REPLY for any reason, call again just for it
-    reply_match = __import__('re').search(r'SUGGESTED REPLY:\s*([\s\S]*)', result, __import__('re').IGNORECASE)
-    reply_text  = reply_match.group(1).strip() if reply_match else ""
-
+    
+    # Try up to 2 times to get a good response
+    result = ""
+    for attempt in range(2):
+        result = await call_groq(messages, max_tokens=1500, model="llama-3.3-70b-versatile")
+        
+        # Check if we have all required sections
+        has_tone = re.search(r'^TONE:\s*\S+', result, re.MULTILINE)
+        has_risk = re.search(r'^RISK:\s*\S+', result, re.MULTILINE)
+        has_reply = re.search(r'SUGGESTED REPLY:\s*\S+', result, re.IGNORECASE | re.MULTILINE)
+        
+        if has_tone and has_risk and has_reply:
+            break  # Good response
+        elif attempt == 0:
+            # Add stronger instruction on retry
+            messages[1]["content"] += "\n\nYOU MISSED SECTIONS. Include ALL sections: TONE, URGENCY, VIBE, INTENT, RISK, SITUATION, CONTEXT ANALYSIS, CONFLICTS, SUGGESTED REPLY. Never leave RISK blank."
+    
+    # Ensure we have a reply
+    reply_match = re.search(r'SUGGESTED REPLY:\s*([\s\S]*)', result, re.IGNORECASE)
+    reply_text = reply_match.group(1).strip() if reply_match else ""
+    
     if not reply_text:
         fallback = await get_fallback_reply(body.thread or "", body.draft or "", today)
-        result = result.rstrip() + "\n\nSUGGESTED REPLY:\n" + fallback
+        # Add missing sections if needed
+        if not re.search(r'^RISK:\s*\S+', result, re.MULTILINE):
+            result = result.rstrip() + "\n\nRISK: Low\n\nSUGGESTED REPLY:\n" + fallback
+        else:
+            result = result.rstrip() + "\n\nSUGGESTED REPLY:\n" + fallback
 
     return FixResponse(result=result, fixes_used=fixes_used, fixes_remaining=fixes_remaining)
 
