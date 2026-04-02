@@ -11,6 +11,7 @@ import json
 import re
 import time
 import hashlib
+import sys
 import httpx
 from datetime import datetime, timedelta
 from typing import Optional
@@ -26,6 +27,14 @@ from slowapi.errors import RateLimitExceeded
 from jose import jwt, JWTError
 
 load_dotenv()
+
+# Ensure we can import `thinkmail-backend/database.py` when this file is deployed
+# from different project roots (Vercel can vary its working directory).
+_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
+if _BACKEND_DIR not in sys.path:
+    sys.path.append(_BACKEND_DIR)
+
+from database import upsert_user
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
@@ -356,8 +365,20 @@ async def auth_callback(code: str, request: Request):
 
         user_info = user_response.json()
 
-    user_id = hashlib.sha256(user_info["email"].encode()).hexdigest()[:16]
-    jwt_token = create_jwt(user_id, user_info["email"], user_info.get("name", ""))
+    email = user_info["email"]
+    name = user_info.get("name", "")
+    user_id = hashlib.sha256(email.encode()).hexdigest()[:16]
+
+    # Persist user row + last_seen in Supabase.
+    # If this fails, auth still continues, but Supabase will not update.
+    # (We avoid blocking the redirect so the user flow doesn't break.)
+    try:
+        await upsert_user(email=email, name=name, user_id=user_id)
+    except Exception:
+        # In Vercel logs we want some signal; keep it generic to avoid leaking secrets.
+        print("[ThinkMail] Supabase upsert_user failed during sign-in")
+
+    jwt_token = create_jwt(user_id, email, name)
 
     # Return token to extension via redirect with token in URL fragment
     # The extension's auth page reads this and stores it
