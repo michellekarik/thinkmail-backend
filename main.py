@@ -188,24 +188,64 @@ async def callback(code: str):
 @app.get("/auth/extension-callback")
 async def extension_callback(token: str, name: str = "", email: str = ""):
     return HTMLResponse(f"""
+<!DOCTYPE html>
 <html>
-<body style="background:#0d1117;color:white;text-align:center;padding-top:100px">
+<head>
+<meta charset="UTF-8">
+<title>ThinkMail - Signed In</title>
+</head>
+
+<body style="background:#0d1117;color:white;text-align:center;padding-top:100px;font-family:sans-serif;">
 
 <h1>✅ Signed in successfully to ThinkMail</h1>
 <p>{email}</p>
-<p>Redirecting to Gmail in 2 seconds...</p>
+<p>Redirecting you to Gmail...</p>
 <p><a href="https://mail.google.com" style="color:#58a6ff">Click here if not redirected</a></p>
 
 <script>
-localStorage.setItem("thinkmail_token", "{token}");
-setTimeout(function() {{
-    window.location.replace("https://mail.google.com");
-}}, 2000);
+const token = "{token}";
+const name = "{name}";
+const email = "{email}";
+
+// Save to BOTH storages (important)
+try {{
+    localStorage.setItem("thinkmail_token", token);
+    localStorage.setItem("thinkmail_name", name);
+    localStorage.setItem("thinkmail_email", email);
+}} catch(e) {{}}
+
+// 🔥 FORCE REDIRECT (WORKS IN EXTENSION CONTEXT)
+function forceRedirect() {{
+    console.log("[ThinkMail] Redirecting to Gmail...");
+
+    try {{
+        window.open("https://mail.google.com", "_self");
+    }} catch(e) {{}}
+
+    try {{
+        window.location.href = "https://mail.google.com";
+    }} catch(e) {{}}
+
+    try {{
+        window.location.replace("https://mail.google.com");
+    }} catch(e) {{}}
+
+    try {{
+        top.location.href = "https://mail.google.com";
+    }} catch(e) {{}}
+}}
+
+// Run after 2 seconds
+setTimeout(forceRedirect, 2000);
+
+// 🔥 BACKUP (in case tab is idle / throttled)
+setTimeout(forceRedirect, 3500);
 </script>
 
 </body>
 </html>
 """)
+
 
 # ── FIX ROUTE ─────────────────────────────────────
 
