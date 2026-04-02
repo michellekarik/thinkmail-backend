@@ -34,7 +34,7 @@ _BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
 if _BACKEND_DIR not in sys.path:
     sys.path.append(_BACKEND_DIR)
 
-from database import upsert_user
+from database import upsert_user, increment_usage, get_user_stats
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
@@ -411,8 +411,11 @@ async def fix_email(
     """
     user_id = user["sub"]
 
-    # Check daily usage limit
-    fixes_used, fixes_remaining = check_and_increment_usage(user_id)
+    # Persist usage in Supabase (fixes_today / total_fixes / reset timestamp).
+    try:
+        fixes_used, fixes_remaining = await increment_usage(user_id)
+    except Exception as e:
+        raise HTTPException(status_code=429, detail=str(e))
 
     # Build prompt and call Groq
     today = datetime.now().strftime("%A, %B %d %Y")
@@ -438,18 +441,7 @@ async def fix_email(
 @app.get("/usage")
 async def get_usage(user: dict = Depends(get_current_user)):
     """Get current user's daily usage"""
-    user_id = user["sub"]
-    now = time.time()
-
-    if user_id not in usage_tracker or usage_tracker[user_id]["reset_at"] <= now:
-        return {"fixes_used": 0, "fixes_remaining": FREE_TIER_LIMIT, "limit": FREE_TIER_LIMIT}
-
-    count = usage_tracker[user_id]["count"]
-    return {
-        "fixes_used": count,
-        "fixes_remaining": max(0, FREE_TIER_LIMIT - count),
-        "limit": FREE_TIER_LIMIT
-    }
+    return await get_user_stats(user["sub"])
 
 @app.get("/me")
 async def get_me(user: dict = Depends(get_current_user)):
