@@ -1,34 +1,35 @@
 """
-ThinkMail Backend (FIXED)
+ThinkMail Backend (FINAL WORKING)
 """
 
 import os
-import json
-import re
 import hashlib
 import httpx
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel
-from dotenv import load_dotenv
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from jose import jwt, JWTError
-from database import upsert_user, increment_usage, get_user_stats
 
-load_dotenv()
+from database import upsert_user
+
+# ── ENV ─────────────────────────────────────
 
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY")
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 JWT_SECRET           = os.getenv("JWT_SECRET", "change-this-in-production")
-FRONTEND_URL         = os.getenv("FRONTEND_URL", "http://localhost:8000")
-REDIRECT_URI         = os.getenv("REDIRECT_URI", "http://localhost:8000/auth/callback")
+
+REDIRECT_URI = "https://thinkmail-backend.vercel.app/auth/callback"
+
+# ── APP SETUP ─────────────────────────────────────
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
@@ -41,11 +42,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {"status": "ThinkMail running"}
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429, content={"error": "Too many requests."})
 
-# ── Models ─────────────────────────────────────
+# ── MODELS ─────────────────────────────────────
 
 class FixRequest(BaseModel):
     thread: Optional[str] = ""
@@ -75,7 +80,12 @@ def verify_jwt(token: str):
 
 def get_current_user(request: Request):
     auth = request.headers.get("Authorization", "")
-    return verify_jwt(auth.split(" ")[1])
+    
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    token = auth.split(" ")[1]
+    return verify_jwt(token)
 
 # ── GROQ ─────────────────────────────────────
 
@@ -93,14 +103,13 @@ async def call_groq(messages):
         )
     return res.json()["choices"][0]["message"]["content"]
 
-# ── PROMPT (FIXED CORE LOGIC) ─────────────────────────────────────
+# ── PROMPT ─────────────────────────────────────
 
 def build_prompt(thread: str, draft: str, today: str):
-
     return [
         {
             "role": "system",
-            "content": f"""
+            "content": """
 You are ThinkMail — elite email strategist.
 
 RULES:
@@ -147,13 +156,13 @@ INSTRUCTIONS:
 
 @app.get("/auth/google")
 async def auth_google():
-    params = "&".join([
-        "response_type=code",
-        f"client_id={GOOGLE_CLIENT_ID}",
-        f"redirect_uri={REDIRECT_URI}",
-        "scope=openid email profile"
-    ])
-    return RedirectResponse("https://accounts.google.com/o/oauth2/v2/auth?" + params)
+    params = urlencode({
+        "response_type": "code",
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": "openid email profile"
+    })
+    return RedirectResponse(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
 
 @app.get("/auth/callback")
 async def callback(code: str):
@@ -184,7 +193,7 @@ async def callback(code: str):
         f"/auth/extension-callback?token={jwt_token}&name={data['name']}&email={data['email']}"
     )
 
-# ── FIXED SIGN-IN PAGE ─────────────────────────────────────
+# ── EXTENSION CALLBACK ─────────────────────────────────────
 
 @app.get("/auth/extension-callback")
 async def extension_callback(token: str, name: str = "", email: str = ""):
@@ -211,7 +220,6 @@ window.close();
 </body>
 </html>
 """)
-
 
 # ── FIX ROUTE ─────────────────────────────────────
 
